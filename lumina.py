@@ -1,7 +1,6 @@
 import os
 import subprocess
 import tkinter as tk
-from tkinter import messagebox
 import time
 import sys
 import threading
@@ -23,26 +22,29 @@ else:
 CONFIG_FILE = os.path.join(BASE_DIR, "app_config.txt")
 
 # ----------------------------------------------------------------------
-# デザイントークン — AudioSwitcherシリーズと同じグラファイト×カッパー配色。
+# デザイントークン — 「Lumina(光)」らしい、深い紫紺の背景に暖色の
+# グロー(光暈)が浮かぶ配色。AudioSwitcherシリーズの渋いグラファイト×
+# カッパーとは意図的に differentiate し、単体ブランドとして今風に。
 # ----------------------------------------------------------------------
-COLOR_BG            = "#16151a"
-COLOR_PANEL         = "#1d1b21"
-COLOR_TRACK         = "#26232b"
-COLOR_BORDER        = "#322e38"
-COLOR_ACCENT        = "#d68a4c"
-COLOR_ACCENT_HOVER  = "#e6a05f"
-COLOR_TEXT_MAIN     = "#f2ece1"
-COLOR_TEXT_SUB      = "#8f8878"
-COLOR_TEXT_FAINT    = "#5c5850"
+COLOR_PANEL_BG      = "#1b1531"
+COLOR_PANEL_BG_ALT  = "#231a3f"  # マスターフェーダー行のハイライト用
+COLOR_PANEL_BORDER  = "#4a3d78"
+COLOR_TRACK         = "#2c2450"
+COLOR_ACCENT        = "#ffb454"
+COLOR_ACCENT_HOVER  = "#ffcf8c"
+COLOR_ACCENT_SOFT   = "#7c6bb8"  # サブアクセント(マスターの目盛りなどに使用)
+COLOR_TEXT_MAIN     = "#f8f6ff"
+COLOR_TEXT_SUB      = "#a79fd6"
+COLOR_TEXT_FAINT    = "#655a99"
+COLOR_TRANSPARENT_KEY = "#0a090f"  # ウィンドウの角丸を出すための透過キー色
 
-FONT_TITLE = ("Segoe UI Semibold", 12)
+FONT_TITLE = ("Segoe UI Semibold", 9)
 FONT_BODY  = ("Segoe UI", 10)
-FONT_MONO  = ("Consolas", 10, "bold")
+FONT_MONO  = ("Consolas", 9, "bold")
 
 DEFAULT_SETTINGS = {
     "startup": "0",
-    "large_slider": "0",
-    "show_toast_after": "1",
+    "show_toast_after": "0",     # 「調整後の明るさを表示する」。既定でOFF
     "show_number": "1",
     "delay_until_release": "0",  # 「止まるまで変更を遅らせる」。0=ドラッグ中も逐次反映、1=離した時だけ反映
     "link_sliders": "0",         # 「一斉に動かせるようにする」
@@ -69,11 +71,26 @@ def _log_thread_exception(args):
 threading.excepthook = _log_thread_exception
 
 
+def enable_dpi_awareness():
+    """Per-Monitor DPIを意識させる。これを呼ばないとTkinterの描画がOSに
+    よって拡大縮小され(見た目が滲む/荒くなる)、かつマルチモニター環境で
+    GetCursorPos等の物理ピクセル座標とTk側の論理座標がズレて、パネルが
+    意図しない位置(左上など)に出ることがある。exeとしてPyInstallerで
+    固めた場合、マニフェストでのDPI宣言がないためコード側で明示する。"""
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception as e:
+            log_error("enable_dpi_awareness", e)
+
+
 def kill_previous_instances():
-    """裏で既に動いている古いBrightSwitchのプロセスをすべて安全に終了させる"""
+    """裏で既に動いている古いLuminaのプロセスをすべて安全に終了させる"""
     try:
         current_pid = os.getpid()
-        target_process = "BrightSwitch.exe"
+        target_process = "Lumina.exe"
         if getattr(sys, 'frozen', False):
             subprocess.run(
                 f'taskkill /F /IM {target_process} /FI "PID ne {current_pid}"',
@@ -118,6 +135,43 @@ def set_monitor_brightness(index, value):
 
 
 # ----------------------------------------------------------------------
+# DDC/CI書き込みの非同期化(スライダーのドラッグを軽くする)
+#
+# DDC/CI通信はI2C経由で1回あたり数十〜百ms以上かかることがある。UIの
+# ドラッグイベントの中で直接sbc.set_brightness()を呼ぶと、特に「一斉に
+# 動かせるようにする」でモニター台数分まとめて呼んだ時に、ドラッグ操作
+# そのものがカクつく(重い)。ここでは「各モニターについて直近の目標値
+# だけを保持し、別スレッドが空き次第それを書き込む」方式にして、UI側の
+# 描画・入力処理は一切ブロックしないようにする。
+# ----------------------------------------------------------------------
+
+_pending_lock = threading.Lock()
+_pending_values = {}
+_pending_wake = threading.Event()
+
+
+def request_brightness(index, value):
+    """このモニターの目標値を更新する(即座には書き込まない)"""
+    with _pending_lock:
+        _pending_values[index] = value
+    _pending_wake.set()
+
+
+def _brightness_writer_worker():
+    while True:
+        _pending_wake.wait()
+        with _pending_lock:
+            items = list(_pending_values.items())
+            _pending_values.clear()
+            _pending_wake.clear()
+        for index, value in items:
+            try:
+                set_monitor_brightness(index, value)
+            except Exception as e:
+                log_error(f"brightness_writer[{index}]", e)
+
+
+# ----------------------------------------------------------------------
 # 設定ファイル(key=value形式)
 # ----------------------------------------------------------------------
 
@@ -150,7 +204,7 @@ def manage_startup(enabled):
     """Windowsのスタートアップフォルダへの自動登録・解除"""
     try:
         startup_dir = winshell.startup()
-        shortcut_path = os.path.join(startup_dir, "BrightSwitch.lnk")
+        shortcut_path = os.path.join(startup_dir, "Lumina.lnk")
 
         if enabled:
             if getattr(sys, 'frozen', False):
@@ -179,7 +233,7 @@ def manage_startup(enabled):
 
 
 # ----------------------------------------------------------------------
-# 幾何ヘルパー(AudioSwitcherシリーズ共通)
+# 幾何ヘルパー
 # ----------------------------------------------------------------------
 
 class _RECT(ctypes.Structure):
@@ -197,16 +251,36 @@ class _MONITORINFO(ctypes.Structure):
 
 
 def _active_monitor_work_area():
-    """マウスカーソルがあるモニターの作業領域(タスクバーを除く)を返す"""
+    """マウスカーソルがあるモニターの作業領域(タスクバーを除く)を返す。
+    失敗した場合は例外を投げる(呼び出し側でフォールバックする)。"""
     pt = _POINT()
-    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    if not ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
+        raise OSError("GetCursorPos failed")
     MONITOR_DEFAULTTONEAREST = 2
     hmonitor = ctypes.windll.user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+    if not hmonitor:
+        raise OSError("MonitorFromPoint failed")
     info = _MONITORINFO()
     info.cbSize = ctypes.sizeof(_MONITORINFO)
-    ctypes.windll.user32.GetMonitorInfoW(hmonitor, ctypes.byref(info))
+    if not ctypes.windll.user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+        raise OSError("GetMonitorInfoW failed")
     rc = info.rcWork
+    if rc.right <= rc.left or rc.bottom <= rc.top:
+        raise OSError(f"invalid work area rect: {rc.left},{rc.top},{rc.right},{rc.bottom}")
     return rc.left, rc.top, rc.right, rc.bottom
+
+
+def _safe_work_area(fallback_window):
+    """_active_monitor_work_area()が失敗した場合、少なくとも実際に存在する
+    画面範囲に収まるようプライマリモニターの座標にフォールバックする
+    (0,0起点で決め打ちにすると本当に左上に出てしまうため、それも避ける)。"""
+    try:
+        return _active_monitor_work_area()
+    except Exception as e:
+        log_error("work_area_fallback", e)
+        w = fallback_window.winfo_screenwidth()
+        h = fallback_window.winfo_screenheight()
+        return 0, 0, w, h
 
 
 def _rounded_rect(cv, x1, y1, x2, y2, r, **kwargs):
@@ -215,6 +289,22 @@ def _rounded_rect(cv, x1, y1, x2, y2, r, **kwargs):
         x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
     ]
     return cv.create_polygon(points, smooth=True, **kwargs)
+
+
+def _lerp_color(c1, c2, t):
+    """2つの#rrggbb色をtで線形補間する。透明度が使えないCanvas上で
+    "薄いグロー"を表現するため、背景色に向かってブレンドする用途に使う。"""
+    t = max(0.0, min(1.0, t))
+    r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+    r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+    r = round(r1 + (r2 - r1) * t)
+    g = round(g1 + (g2 - g1) * t)
+    b = round(b1 + (b2 - b1) * t)
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _ease_out_cubic(t):
+    return 1 - (1 - t) ** 3
 
 
 # ----------------------------------------------------------------------
@@ -242,23 +332,28 @@ def render_tray_icon():
 
 
 # ----------------------------------------------------------------------
-# モダンなカスタムスライダー(Canvas描画・角丸トラック・アクセント色)
+# モダンなカスタムスライダー(Canvas描画・細身のトラック・
+# ドラッグ中はつまみの周りにグロー(光暈)が浮かぶ)
 # ----------------------------------------------------------------------
 
 class ModernSlider:
-    def __init__(self, canvas, x, y, width, height, value=50, on_change=None, on_release=None):
+    TRACK_THICKNESS = 4
+    THUMB_R = 7
+    THUMB_R_ACTIVE = 8
+
+    def __init__(self, canvas, x, y, width, height, value=50, on_change=None, on_release=None,
+                 panel_bg=COLOR_PANEL_BG):
         self.canvas = canvas
         self.x, self.y, self.width, self.height = x, y, width, height
         self.value = value
         self.on_change = on_change
         self.on_release = on_release
+        self.panel_bg = panel_bg
         self._dragging = False
         self._items = []
 
-        canvas.tag_bind("bg", "<Enter>", lambda e: None)  # no-op anchor for tag namespace safety
-
         self._hit_id = canvas.create_rectangle(
-            x, y, x + width, y + height, fill="", outline="", tags="slider_hit"
+            x, y, x + width, y + height, fill="", outline=""
         )
         canvas.tag_bind(self._hit_id, "<Button-1>", self._on_press)
         canvas.tag_bind(self._hit_id, "<B1-Motion>", self._on_drag)
@@ -267,14 +362,10 @@ class ModernSlider:
         self.redraw()
 
     def _value_from_x(self, event_x):
-        track_x1 = self.x + self._thumb_r
-        track_x2 = self.x + self.width - self._thumb_r
+        track_x1 = self.x + self.THUMB_R_ACTIVE
+        track_x2 = self.x + self.width - self.THUMB_R_ACTIVE
         ratio = (event_x - track_x1) / max(1, (track_x2 - track_x1))
         return max(0, min(100, ratio * 100))
-
-    @property
-    def _thumb_r(self):
-        return self.height / 2 + 3
 
     def _on_press(self, event):
         self._dragging = True
@@ -293,6 +384,7 @@ class ModernSlider:
 
     def _on_release(self, event):
         self._dragging = False
+        self.redraw()
         if self.on_release:
             self.on_release(self.value)
 
@@ -306,32 +398,45 @@ class ModernSlider:
             self.canvas.delete(item)
         self._items.clear()
 
-        track_y1 = self.y + self.height / 2 - 4
-        track_y2 = self.y + self.height / 2 + 4
-        track_x1 = self.x + self._thumb_r
-        track_x2 = self.x + self.width - self._thumb_r
+        t = self.TRACK_THICKNESS / 2
+        track_y1 = self.y + self.height / 2 - t
+        track_y2 = self.y + self.height / 2 + t
+        track_x1 = self.x + self.THUMB_R_ACTIVE
+        track_x2 = self.x + self.width - self.THUMB_R_ACTIVE
 
         self._items.append(_rounded_rect(
-            self.canvas, track_x1, track_y1, track_x2, track_y2, 4,
+            self.canvas, track_x1, track_y1, track_x2, track_y2, t,
             fill=COLOR_TRACK, outline=""
         ))
 
         fill_x = track_x1 + (track_x2 - track_x1) * (self.value / 100)
         if fill_x > track_x1 + 1:
             self._items.append(_rounded_rect(
-                self.canvas, track_x1, track_y1, fill_x, track_y2, 4,
+                self.canvas, track_x1, track_y1, fill_x, track_y2, t,
                 fill=COLOR_ACCENT, outline=""
             ))
 
         thumb_cx = fill_x
         thumb_cy = self.y + self.height / 2
-        r = self._thumb_r
+
+        if self._dragging:
+            # ドラッグ中だけ、つまみの周りにグロー(光暈)を薄く重ねて表示する。
+            # Canvasは半透明塗りを扱えないため、背景色に向けて色をブレンド
+            # した同心円を重ねることで擬似的なグローを表現している。
+            for ring_r, mix in ((16, 0.72), (12, 0.5)):
+                glow_color = _lerp_color(COLOR_ACCENT, self.panel_bg, mix)
+                self._items.append(self.canvas.create_oval(
+                    thumb_cx - ring_r, thumb_cy - ring_r, thumb_cx + ring_r, thumb_cy + ring_r,
+                    fill=glow_color, outline=""
+                ))
+
+        r = self.THUMB_R_ACTIVE if self._dragging else self.THUMB_R
+        fill = COLOR_ACCENT_HOVER if self._dragging else COLOR_TEXT_MAIN
         self._items.append(self.canvas.create_oval(
             thumb_cx - r, thumb_cy - r, thumb_cx + r, thumb_cy + r,
-            fill=COLOR_TEXT_MAIN, outline=COLOR_ACCENT, width=2
+            fill=fill, outline=COLOR_ACCENT, width=2
         ))
 
-        # ヒット領域(操作対象)を最前面に上げ直す
         self.canvas.tag_raise(self._hit_id)
 
 
@@ -340,8 +445,13 @@ class ModernSlider:
 # ----------------------------------------------------------------------
 
 class SliderPanel:
-    ROW_HEIGHT = 46
+    ROW_HEIGHT = 44
+    HEADER_HEIGHT = 34
     PADDING = 18
+    WIDTH = 320
+    CORNER_RADIUS = 16
+    ANIM_DURATION_MS = 190
+    ANIM_SLIDE_PX = 14
 
     def __init__(self, root):
         self.root = root
@@ -349,41 +459,47 @@ class SliderPanel:
         self.canvas = None
         self.sliders = []
         self.value_labels = []
+        self.master_slider = None
+        self.master_label = None
         self.snapshot = []
+        self._anim_job = None
+        self._anim_start = 0
+        self._final_x = 0
+        self._final_y = 0
 
-    def _apply_brightness(self, monitor_index, value, is_final, link_sliders):
+    def _apply_brightness(self, monitor_index, value, is_final):
+        """個別モニターのスライダーの値を反映する。「一斉に動かせるように
+        する」がONの時でも、個別スライダーは常にそのモニターだけを独立して
+        動かす(連動はマスターフェーダー経由でのみ行う)。"""
         settings = load_config()
         delay_mode = settings.get("delay_until_release", "0") == "1"
 
         if delay_mode and not is_final:
             return  # 「止まるまで変更を遅らせる」がONの間はドラッグ中は反映しない
 
-        try:
-            new_value = set_monitor_brightness(monitor_index, value)
-        except Exception as e:
-            log_error("panel_set_brightness", e)
+        request_brightness(monitor_index, value)
+
+        if is_final and settings.get("show_toast_after", "0") == "1":
+            toast_manager = getattr(self.root, "_toast_manager", None)
+            if toast_manager:
+                toast_manager.show(value)
+
+    def _apply_master(self, value, is_final):
+        settings = load_config()
+        delay_mode = settings.get("delay_until_release", "0") == "1"
+        if delay_mode and not is_final:
             return
 
-        if link_sliders:
-            self._sync_linked_sliders(monitor_index, new_value, is_final, delay_mode)
-
-        if is_final and settings.get("show_toast_after", "1") == "1":
-            from_toast = getattr(self.root, "_toast_manager", None)
-            if from_toast:
-                from_toast.show(new_value)
-
-    def _sync_linked_sliders(self, source_index, source_value, is_final, delay_mode):
         for m, slider, label in zip(self.snapshot, self.sliders, self.value_labels):
-            if m["index"] == source_index:
-                continue
-            slider.set_value(source_value)
+            slider.set_value(value)
             if label is not None:
-                label.configure(text=f"{int(round(source_value))}%")
-            if not delay_mode or is_final:
-                try:
-                    set_monitor_brightness(m["index"], source_value)
-                except Exception as e:
-                    log_error("panel_set_brightness_linked", e)
+                label.configure(text=f"{int(round(value))}%")
+            request_brightness(m["index"], value)
+
+        if is_final and settings.get("show_toast_after", "0") == "1":
+            toast_manager = getattr(self.root, "_toast_manager", None)
+            if toast_manager:
+                toast_manager.show(value)
 
     def toggle(self):
         if self.window is not None and self.window.winfo_viewable():
@@ -394,26 +510,27 @@ class SliderPanel:
     def open(self):
         self.close()
         settings = load_config()
-        large = settings.get("large_slider", "0") == "1"
         show_number = settings.get("show_number", "1") == "1"
         link_sliders = settings.get("link_sliders", "0") == "1"
 
         self.snapshot = get_monitor_snapshot()
+        has_master = link_sliders and len(self.snapshot) > 1
 
-        row_h = self.ROW_HEIGHT + (14 if large else 0)
-        slider_h = 18 if large else 12
-        width = 340
+        row_h = self.ROW_HEIGHT
+        width = self.WIDTH
         rows = max(1, len(self.snapshot))
-        height = self.PADDING * 2 + rows * row_h + (30 if not self.snapshot else 0)
+        body_h = rows * row_h if self.snapshot else 50
+        master_h = row_h + 6 if has_master else 0
+        height = self.HEADER_HEIGHT + master_h + body_h + self.PADDING
 
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
         win.attributes("-topmost", True)
-        win.configure(bg=COLOR_BORDER)
+        win.attributes("-alpha", 0.0)
+        win.configure(bg=COLOR_TRANSPARENT_KEY)
+        win.attributes("-transparentcolor", COLOR_TRANSPARENT_KEY)
 
-        outer = tk.Frame(win, bg=COLOR_BORDER)
-        outer.pack(padx=1, pady=1)
-        canvas = tk.Canvas(outer, width=width, height=height, bg=COLOR_PANEL,
+        canvas = tk.Canvas(win, width=width, height=height, bg=COLOR_TRANSPARENT_KEY,
                             highlightthickness=0)
         canvas.pack()
 
@@ -421,17 +538,105 @@ class SliderPanel:
         self.canvas = canvas
         self.sliders = []
         self.value_labels = []
+        self.master_slider = None
+        self.master_label = None
+
+        # 角丸パネル本体
+        _rounded_rect(canvas, 0, 0, width, height, self.CORNER_RADIUS,
+                      fill=COLOR_PANEL_BG, outline=COLOR_PANEL_BORDER, width=1.2)
+
+        # ヘッダー(タイトル + 閉じるボタン)
+        canvas.create_text(
+            self.PADDING, self.HEADER_HEIGHT / 2, anchor="w", text="LUMINA",
+            fill=COLOR_TEXT_SUB, font=("Segoe UI", 8, "bold")
+        )
+        close_cx, close_cy, close_r = width - self.PADDING, self.HEADER_HEIGHT / 2, 9
+        close_hit = canvas.create_oval(
+            close_cx - close_r, close_cy - close_r, close_cx + close_r, close_cy + close_r,
+            fill="", outline=""
+        )
+        close_line1 = canvas.create_line(
+            close_cx - 4, close_cy - 4, close_cx + 4, close_cy + 4,
+            fill=COLOR_TEXT_SUB, width=1.4
+        )
+        close_line2 = canvas.create_line(
+            close_cx - 4, close_cy + 4, close_cx + 4, close_cy - 4,
+            fill=COLOR_TEXT_SUB, width=1.4
+        )
+        for item in (close_hit, close_line1, close_line2):
+            canvas.tag_bind(item, "<Button-1>", lambda e: self.close())
+        canvas.tag_bind(close_hit, "<Enter>", lambda e: (
+            canvas.itemconfig(close_line1, fill=COLOR_TEXT_MAIN),
+            canvas.itemconfig(close_line2, fill=COLOR_TEXT_MAIN),
+        ))
+        canvas.tag_bind(close_hit, "<Leave>", lambda e: (
+            canvas.itemconfig(close_line1, fill=COLOR_TEXT_SUB),
+            canvas.itemconfig(close_line2, fill=COLOR_TEXT_SUB),
+        ))
+        canvas.create_line(
+            self.PADDING * 0.4, self.HEADER_HEIGHT, width - self.PADDING * 0.4, self.HEADER_HEIGHT,
+            fill=COLOR_PANEL_BORDER
+        )
+
+        cursor_y = self.HEADER_HEIGHT
 
         if not self.snapshot:
             canvas.create_text(
-                width / 2, height / 2, text="DDC/CI対応モニターが見つかりません",
-                fill=COLOR_TEXT_SUB, font=FONT_BODY
+                width / 2, self.HEADER_HEIGHT + body_h / 2,
+                text="DDC/CI対応モニターが\n見つかりません",
+                fill=COLOR_TEXT_SUB, font=FONT_BODY, justify="center"
             )
         else:
+            if has_master:
+                master_row_y = cursor_y + 8
+                _rounded_rect(
+                    canvas, self.PADDING * 0.4, cursor_y + 2, width - self.PADDING * 0.4,
+                    cursor_y + master_h - 4, 10, fill=COLOR_PANEL_BG_ALT, outline=""
+                )
+                canvas.create_text(
+                    self.PADDING, master_row_y, anchor="nw", text="すべてのモニター",
+                    fill=COLOR_ACCENT, font=("Segoe UI", 10, "bold")
+                )
+
+                master_value = round(
+                    sum((m["brightness"] or 0) for m in self.snapshot) / len(self.snapshot)
+                )
+                master_label = None
+                label_w = 0
+                if show_number:
+                    label_w = 34
+                    master_label = tk.Label(
+                        win, text=f"{master_value}%", font=FONT_MONO,
+                        fg=COLOR_ACCENT, bg=COLOR_PANEL_BG_ALT
+                    )
+                    canvas.create_window(
+                        width - self.PADDING, master_row_y + 17, anchor="ne", window=master_label
+                    )
+
+                slider_width = width - self.PADDING * 2 - label_w - (6 if show_number else 0)
+
+                def on_master_change(value, is_final):
+                    if master_label is not None:
+                        master_label.configure(text=f"{int(round(value))}%")
+                    self._apply_master(value, is_final)
+
+                def on_master_release(value):
+                    if master_label is not None:
+                        master_label.configure(text=f"{int(round(value))}%")
+                    self._apply_master(value, True)
+
+                self.master_slider = ModernSlider(
+                    canvas, self.PADDING, master_row_y + 18, slider_width, 14,
+                    value=master_value, on_change=on_master_change, on_release=on_master_release,
+                    panel_bg=COLOR_PANEL_BG_ALT,
+                )
+                self.master_label = master_label
+                cursor_y += master_h
+
             for i, m in enumerate(self.snapshot):
-                row_y = self.PADDING + i * row_h
+                row_y = cursor_y + i * row_h + 10
                 name = m["name"]
-                display_name = name if len(name) <= 22 else name[:20] + "..."
+                display_name = name if len(name) <= 24 else name[:22] + "..."
                 canvas.create_text(
                     self.PADDING, row_y, anchor="nw", text=display_name,
                     fill=COLOR_TEXT_MAIN, font=FONT_BODY
@@ -440,48 +645,66 @@ class SliderPanel:
                 value_label = None
                 label_w = 0
                 if show_number:
-                    label_w = 40
+                    label_w = 34
                     value_label = tk.Label(
                         win, text=f"{m['brightness'] or 0}%", font=FONT_MONO,
-                        fg=COLOR_ACCENT, bg=COLOR_PANEL
+                        fg=COLOR_ACCENT, bg=COLOR_PANEL_BG
                     )
                     canvas.create_window(
-                        width - self.PADDING, row_y + 20, anchor="ne", window=value_label
+                        width - self.PADDING, row_y + 17, anchor="ne", window=value_label
                     )
 
-                slider_y = row_y + 22
-                slider_width = width - self.PADDING * 2 - label_w - (8 if show_number else 0)
+                slider_y = row_y + 18
+                slider_width = width - self.PADDING * 2 - label_w - (6 if show_number else 0)
 
                 def on_change(value, is_final, index=m["index"], label=value_label):
                     if label is not None:
                         label.configure(text=f"{int(round(value))}%")
-                    self._apply_brightness(index, value, is_final, link_sliders)
+                    self._apply_brightness(index, value, is_final)
 
                 def on_release(value, index=m["index"], label=value_label):
                     if label is not None:
                         label.configure(text=f"{int(round(value))}%")
-                    self._apply_brightness(index, value, True, link_sliders)
+                    self._apply_brightness(index, value, True)
 
                 slider = ModernSlider(
-                    canvas, self.PADDING, slider_y, slider_width, slider_h,
+                    canvas, self.PADDING, slider_y, slider_width, 14,
                     value=m["brightness"] or 0, on_change=on_change, on_release=on_release
                 )
                 self.sliders.append(slider)
                 self.value_labels.append(value_label)
 
         win.update_idletasks()
-        try:
-            left, top, right, bottom = _active_monitor_work_area()
-        except Exception:
-            right, bottom = win.winfo_screenwidth(), win.winfo_screenheight()
+        left, top, right, bottom = _safe_work_area(win)
         win_w = win.winfo_reqwidth()
         win_h = win.winfo_reqheight()
-        x = right - win_w - 8
-        y = bottom - win_h - 8
-        win.geometry(f"{win_w}x{win_h}+{x}+{y}")
+        self._final_x = max(left, right - win_w - 8)
+        self._final_y = max(top, bottom - win_h - 8)
+        win.geometry(f"{win_w}x{win_h}+{self._final_x}+{self._final_y + self.ANIM_SLIDE_PX}")
 
         win.bind("<FocusOut>", lambda e: self.root.after(120, self._close_if_unfocused))
         win.focus_force()
+
+        self._anim_start = time.time()
+        self._animate_open()
+
+    def _animate_open(self):
+        if self.window is None:
+            return
+        elapsed_ms = (time.time() - self._anim_start) * 1000
+        t = min(1.0, elapsed_ms / self.ANIM_DURATION_MS)
+        eased = _ease_out_cubic(t)
+
+        alpha = eased
+        y = round(self._final_y + self.ANIM_SLIDE_PX * (1 - eased))
+        try:
+            self.window.attributes("-alpha", alpha)
+            self.window.geometry(f"+{self._final_x}+{y}")
+        except Exception:
+            return
+
+        if t < 1.0:
+            self._anim_job = self.root.after(8, self._animate_open)
 
     def _close_if_unfocused(self):
         if self.window is None:
@@ -494,6 +717,12 @@ class SliderPanel:
             self.close()
 
     def close(self):
+        if self._anim_job is not None:
+            try:
+                self.root.after_cancel(self._anim_job)
+            except Exception:
+                pass
+            self._anim_job = None
         if self.window is not None:
             try:
                 self.window.destroy()
@@ -503,6 +732,8 @@ class SliderPanel:
             self.canvas = None
             self.sliders = []
             self.value_labels = []
+            self.master_slider = None
+            self.master_label = None
 
 
 # ----------------------------------------------------------------------
@@ -527,12 +758,11 @@ class ToastManager:
         toast.attributes("-topmost", True)
         toast.attributes("-alpha", 0.0)
 
-        transparent_key = "#010203"
-        toast.configure(bg=transparent_key)
-        toast.attributes("-transparentcolor", transparent_key)
+        toast.configure(bg=COLOR_TRANSPARENT_KEY)
+        toast.attributes("-transparentcolor", COLOR_TRANSPARENT_KEY)
 
         canvas = tk.Canvas(toast, width=self.WIDTH, height=self.HEIGHT,
-                            bg=transparent_key, highlightthickness=0)
+                            bg=COLOR_TRANSPARENT_KEY, highlightthickness=0)
         canvas.pack(fill="both", expand=True)
         toast.withdraw()
 
@@ -540,12 +770,7 @@ class ToastManager:
         self.canvas = canvas
 
     def _place(self):
-        try:
-            left, top, right, bottom = _active_monitor_work_area()
-        except Exception:
-            left, top = 0, 0
-            right = self.window.winfo_screenwidth()
-            bottom = self.window.winfo_screenheight()
+        left, top, right, bottom = _safe_work_area(self.window)
         x = right - self.WIDTH - 8
         y = bottom - self.HEIGHT - 8
         self.window.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
@@ -559,9 +784,9 @@ class ToastManager:
         canvas = self.canvas
         canvas.delete("all")
         _rounded_rect(canvas, 1, 1, self.WIDTH - 1, self.HEIGHT - 1, 14,
-                      fill=COLOR_PANEL, outline=COLOR_BORDER, width=1)
+                      fill=COLOR_PANEL_BG, outline=COLOR_PANEL_BORDER, width=1)
         canvas.create_rectangle(0, 10, 4, self.HEIGHT - 10, fill=COLOR_ACCENT, outline="")
-        canvas.create_text(20, 18, anchor="w", text="BRIGHTNESS",
+        canvas.create_text(20, 18, anchor="w", text="LUMINA",
                             fill=COLOR_ACCENT, font=("Segoe UI", 8, "bold"))
         canvas.create_text(20, 38, anchor="w", text=f"{int(round(brightness_percent))}%",
                             fill=COLOR_TEXT_MAIN, font=("Segoe UI", 13, "bold"))
@@ -603,8 +828,6 @@ _ui_action_queue = queue.Queue()
 
 
 def _build_menu():
-    settings = load_config()
-
     def is_on(key):
         return load_config().get(key, "0") == "1"
 
@@ -620,23 +843,34 @@ def _build_menu():
     def on_open_panel(icon, item):
         _ui_action_queue.put(("open_panel", None))
 
+    def on_open_taskbar_settings(icon, item):
+        # アプリ自身がタスクバーへの「常時表示」を強制するAPIはWindowsには
+        # 無い(Vista以降、ユーザーがWindows設定側で明示的に選ぶ仕様)。
+        # そのため設定画面を直接開くショートカットを用意している。
+        try:
+            os.startfile("ms-settings:taskbar")
+        except Exception as e:
+            log_error("open_taskbar_settings", e)
+
     def on_quit(icon, item):
         _ui_action_queue.put(("quit", None))
 
     return pystray.Menu(
         pystray.MenuItem("open", on_open_panel, default=True, visible=False),
         pystray.MenuItem("サインイン時に起動する", toggle("startup"), checked=lambda i: is_on("startup")),
-        pystray.MenuItem("大きいスライダーを使う", toggle("large_slider"), checked=lambda i: is_on("large_slider")),
         pystray.MenuItem("調整後の明るさを表示する", toggle("show_toast_after"), checked=lambda i: is_on("show_toast_after")),
         pystray.MenuItem("現在の数字を表示する", toggle("show_number"), checked=lambda i: is_on("show_number")),
         pystray.MenuItem("止まるまで変更を遅らせる", toggle("delay_until_release"), checked=lambda i: is_on("delay_until_release")),
         pystray.MenuItem("一斉に動かせるようにする", toggle("link_sliders"), checked=lambda i: is_on("link_sliders")),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("タスクバーの表示設定を開く...", on_open_taskbar_settings),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("終了", on_quit),
     )
 
 
 def run_app():
+    enable_dpi_awareness()
     kill_previous_instances()
 
     settings = load_config()
@@ -651,7 +885,7 @@ def run_app():
     root._toast_manager = toast_manager  # SliderPanelから参照するため
     panel = SliderPanel(root)
 
-    tray_icon = pystray.Icon("BrightSwitch", render_tray_icon(), "BrightSwitch", _build_menu())
+    tray_icon = pystray.Icon("Lumina", render_tray_icon(), "Lumina", _build_menu())
 
     def poll_ui_queue():
         try:
@@ -669,6 +903,7 @@ def run_app():
     root.after(50, poll_ui_queue)
 
     threading.Thread(target=tray_icon.run, daemon=True).start()
+    threading.Thread(target=_brightness_writer_worker, daemon=True).start()
     root.mainloop()
 
 

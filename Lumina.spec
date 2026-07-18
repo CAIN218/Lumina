@@ -8,7 +8,7 @@ datas_pystray, binaries_pystray, hiddenimports_pystray = collect_all('pystray')
 datas_pil, binaries_pil, hiddenimports_pil = collect_all('PIL')
 
 a = Analysis(
-    ['brightness_switch.py'],
+    ['lumina.py'],
     pathex=[],
     binaries=binaries_sbc + binaries_wmi + binaries_pystray + binaries_pil,
     datas=datas_sbc + datas_wmi + datas_pystray + datas_pil,
@@ -34,7 +34,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='BrightSwitch',
+    name='Lumina',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

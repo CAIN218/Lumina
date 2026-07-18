@@ -1,0 +1,6 @@
+keyboard
+pywin32
+winshell
+screen_brightness_control
+wmi
+customtkinter

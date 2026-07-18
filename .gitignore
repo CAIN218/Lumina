@@ -1,0 +1,7 @@
+dist/
+build/
+release_package/
+__pycache__/
+app_config.txt
+error.log
+*.pyc

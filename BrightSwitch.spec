@@ -4,17 +4,21 @@ from PyInstaller.utils.hooks import collect_all
 
 datas_sbc, binaries_sbc, hiddenimports_sbc = collect_all('screen_brightness_control')
 datas_wmi, binaries_wmi, hiddenimports_wmi = collect_all('wmi')
-datas_ctk, binaries_ctk, hiddenimports_ctk = collect_all('customtkinter')
+datas_pystray, binaries_pystray, hiddenimports_pystray = collect_all('pystray')
+datas_pil, binaries_pil, hiddenimports_pil = collect_all('PIL')
 
 a = Analysis(
     ['brightness_switch.py'],
     pathex=[],
-    binaries=binaries_sbc + binaries_wmi + binaries_ctk,
-    datas=datas_sbc + datas_wmi + datas_ctk,
+    binaries=binaries_sbc + binaries_wmi + binaries_pystray + binaries_pil,
+    datas=datas_sbc + datas_wmi + datas_pystray + datas_pil,
     hiddenimports=[
         'screen_brightness_control',
         'wmi',
-    ] + hiddenimports_sbc + hiddenimports_wmi + hiddenimports_ctk,
+        'pystray',
+        'pystray._win32',
+        'PIL',
+    ] + hiddenimports_sbc + hiddenimports_wmi + hiddenimports_pystray + hiddenimports_pil,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

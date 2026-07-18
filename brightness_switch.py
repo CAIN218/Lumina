@@ -1,6 +1,5 @@
 import os
 import subprocess
-import keyboard
 import tkinter as tk
 from tkinter import messagebox
 import time
@@ -8,14 +7,13 @@ import sys
 import threading
 import queue
 import ctypes
+import math
 import winshell
 from win32com.client import Dispatch
 
+import pystray
+from PIL import Image, ImageDraw
 import screen_brightness_control as sbc
-
-# customtkinter（設定画面専用のUIライブラリ）はここでは読み込まない。
-# バックグラウンド常駐時はホットキー監視しかしないため、
-# 使わない重いUIアセットをメモリに乗せないよう open_setting_window() 内で遅延importする。
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -23,33 +21,52 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE = os.path.join(BASE_DIR, "app_config.txt")
-ICON_PATH = os.path.join(BASE_DIR, "app_icon.ico")
-
-last_adjust_time = 0
 
 # ----------------------------------------------------------------------
-# デザイントークン — AudioSwitcherと同じグラファイト×カッパー配色を踏襲し、
-# シリーズとして統一感を持たせている。
+# デザイントークン — AudioSwitcherシリーズと同じグラファイト×カッパー配色。
 # ----------------------------------------------------------------------
-COLOR_BG           = "#16151a"
-COLOR_PANEL        = "#1d1b21"
-COLOR_INPUT        = "#26232b"
-COLOR_BORDER       = "#322e38"
-COLOR_ACCENT       = "#d68a4c"
-COLOR_ACCENT_HOVER = "#e6a05f"
-COLOR_ACCENT_DIM   = "#5c4530"
-COLOR_TEXT_MAIN    = "#f2ece1"
-COLOR_TEXT_SUB     = "#8f8878"
-COLOR_TEXT_FAINT   = "#5c5850"
+COLOR_BG            = "#16151a"
+COLOR_PANEL         = "#1d1b21"
+COLOR_TRACK         = "#26232b"
+COLOR_BORDER        = "#322e38"
+COLOR_ACCENT        = "#d68a4c"
+COLOR_ACCENT_HOVER  = "#e6a05f"
+COLOR_TEXT_MAIN     = "#f2ece1"
+COLOR_TEXT_SUB      = "#8f8878"
+COLOR_TEXT_FAINT    = "#5c5850"
 
-FONT_DISPLAY = ("Segoe UI Semibold", 17)
-FONT_LABEL   = ("Segoe UI", 10, "bold")
-FONT_BODY    = ("Segoe UI", 10)
-FONT_MONO    = ("Consolas", 11, "bold")
+FONT_TITLE = ("Segoe UI Semibold", 12)
+FONT_BODY  = ("Segoe UI", 10)
+FONT_MONO  = ("Consolas", 10, "bold")
 
-DEFAULT_HOTKEY_UP = "ctrl+alt+up"
-DEFAULT_HOTKEY_DOWN = "ctrl+alt+down"
-DEFAULT_STEP = "10"
+DEFAULT_SETTINGS = {
+    "startup": "0",
+    "large_slider": "0",
+    "show_toast_after": "1",
+    "show_number": "1",
+    "delay_until_release": "0",  # 「止まるまで変更を遅らせる」。0=ドラッグ中も逐次反映、1=離した時だけ反映
+    "link_sliders": "0",         # 「一斉に動かせるようにする」
+}
+
+
+def log_error(context, exc):
+    """サイレントに握りつぶさず、原因調査用にエラーをログファイルへ記録する"""
+    try:
+        log_path = os.path.join(BASE_DIR, "error.log")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {context}: {repr(exc)}\n")
+            if exc is not None and exc.__traceback__ is not None:
+                import traceback
+                f.write("".join(traceback.format_tb(exc.__traceback__)))
+    except Exception:
+        pass
+
+
+def _log_thread_exception(args):
+    log_error(f"thread:{args.thread.name if args.thread else '?'}", args.exc_value)
+
+
+threading.excepthook = _log_thread_exception
 
 
 def kill_previous_instances():
@@ -67,6 +84,10 @@ def kill_previous_instances():
     except Exception:
         pass
 
+
+# ----------------------------------------------------------------------
+# モニター制御
+# ----------------------------------------------------------------------
 
 def get_monitor_snapshot():
     """接続中のモニター一覧と現在の輝度を取得する。
@@ -96,38 +117,50 @@ def set_monitor_brightness(index, value):
     return value
 
 
+# ----------------------------------------------------------------------
+# 設定ファイル(key=value形式)
+# ----------------------------------------------------------------------
+
 def load_config():
-    """設定ファイルの読み込み"""
+    settings = dict(DEFAULT_SETTINGS)
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            lines = f.read().splitlines()
-            if len(lines) >= 4:
-                return lines[0], lines[1], lines[2], lines[3]
-    return DEFAULT_HOTKEY_UP, DEFAULT_HOTKEY_DOWN, DEFAULT_STEP, "0"
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or "=" not in line:
+                        continue
+                    key, _, value = line.partition("=")
+                    settings[key.strip()] = value.strip()
+        except Exception as e:
+            log_error("load_config", e)
+    return settings
 
 
-def save_config(hotkey_up, hotkey_down, step, startup_val):
-    """設定ファイルの保存とスタートアップ制御"""
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        f.write(f"{hotkey_up}\n{hotkey_down}\n{step}\n{startup_val}")
-    manage_startup(startup_val)
+def save_config(settings):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            for key, value in settings.items():
+                f.write(f"{key}={value}\n")
+    except Exception as e:
+        log_error("save_config", e)
 
 
-def manage_startup(startup_val):
-    """Windowsのスタートアップフォルダへの自動登録・解除（生スクリプト/exeハイブリッド対応）"""
+def manage_startup(enabled):
+    """Windowsのスタートアップフォルダへの自動登録・解除"""
     try:
         startup_dir = winshell.startup()
         shortcut_path = os.path.join(startup_dir, "BrightSwitch.lnk")
 
-        if startup_val == "1":
+        if enabled:
             if getattr(sys, 'frozen', False):
                 target = sys.executable
-                arguments = "/background"
+                arguments = ""
                 icon_target = target
             else:
                 pythonw_path = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
                 target = pythonw_path if os.path.exists(pythonw_path) else sys.executable
-                arguments = f'"{os.path.abspath(__file__)}" /background'
+                arguments = f'"{os.path.abspath(__file__)}"'
                 icon_target = None
 
             shell = Dispatch('WScript.Shell')
@@ -135,17 +168,19 @@ def manage_startup(startup_val):
             shortcut.Targetpath = target
             shortcut.Arguments = arguments
             shortcut.WorkingDirectory = BASE_DIR
-
             if icon_target:
                 shortcut.IconLocation = icon_target
-
             shortcut.save()
         else:
             if os.path.exists(shortcut_path):
                 os.remove(shortcut_path)
     except Exception as e:
-        tk.messagebox.showerror("Startup Error", f"Failed to update startup folder: {str(e)}")
+        log_error("manage_startup", e)
 
+
+# ----------------------------------------------------------------------
+# 幾何ヘルパー(AudioSwitcherシリーズ共通)
+# ----------------------------------------------------------------------
 
 class _RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
@@ -162,7 +197,7 @@ class _MONITORINFO(ctypes.Structure):
 
 
 def _active_monitor_work_area():
-    """マウスカーソルがあるモニターの作業領域（タスクバーを除く）を返す(AudioSwitcherと同じ考え方)"""
+    """マウスカーソルがあるモニターの作業領域(タスクバーを除く)を返す"""
     pt = _POINT()
     ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
     MONITOR_DEFAULTTONEAREST = 2
@@ -182,9 +217,300 @@ def _rounded_rect(cv, x1, y1, x2, y2, r, **kwargs):
     return cv.create_polygon(points, smooth=True, **kwargs)
 
 
-# 常駐中は1枚のToplevelを使い回し、Tclインタプリタの再生成を避ける(AudioSwitcherと同じ理由)
-class _ToastManager:
-    WIDTH, HEIGHT = 320, 68
+# ----------------------------------------------------------------------
+# トレイアイコンの生成(太陽のグリフ。小さいサイズでも潰れないよう
+# 装飾を絞ったフラットデザイン)
+# ----------------------------------------------------------------------
+
+def render_tray_icon():
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    cx, cy = size / 2, size / 2
+    core_r = 15
+    draw.ellipse([cx - core_r, cy - core_r, cx + core_r, cy + core_r], fill=(242, 236, 225, 255))
+
+    ray_inner, ray_outer, ray_width = core_r + 6, core_r + 15, 5
+    for i in range(8):
+        angle = math.radians(i * 45)
+        x1 = cx + ray_inner * math.cos(angle)
+        y1 = cy + ray_inner * math.sin(angle)
+        x2 = cx + ray_outer * math.cos(angle)
+        y2 = cy + ray_outer * math.sin(angle)
+        draw.line([x1, y1, x2, y2], fill=(242, 236, 225, 255), width=ray_width)
+    return img
+
+
+# ----------------------------------------------------------------------
+# モダンなカスタムスライダー(Canvas描画・角丸トラック・アクセント色)
+# ----------------------------------------------------------------------
+
+class ModernSlider:
+    def __init__(self, canvas, x, y, width, height, value=50, on_change=None, on_release=None):
+        self.canvas = canvas
+        self.x, self.y, self.width, self.height = x, y, width, height
+        self.value = value
+        self.on_change = on_change
+        self.on_release = on_release
+        self._dragging = False
+        self._items = []
+
+        canvas.tag_bind("bg", "<Enter>", lambda e: None)  # no-op anchor for tag namespace safety
+
+        self._hit_id = canvas.create_rectangle(
+            x, y, x + width, y + height, fill="", outline="", tags="slider_hit"
+        )
+        canvas.tag_bind(self._hit_id, "<Button-1>", self._on_press)
+        canvas.tag_bind(self._hit_id, "<B1-Motion>", self._on_drag)
+        canvas.tag_bind(self._hit_id, "<ButtonRelease-1>", self._on_release)
+
+        self.redraw()
+
+    def _value_from_x(self, event_x):
+        track_x1 = self.x + self._thumb_r
+        track_x2 = self.x + self.width - self._thumb_r
+        ratio = (event_x - track_x1) / max(1, (track_x2 - track_x1))
+        return max(0, min(100, ratio * 100))
+
+    @property
+    def _thumb_r(self):
+        return self.height / 2 + 3
+
+    def _on_press(self, event):
+        self._dragging = True
+        self.value = self._value_from_x(event.x)
+        self.redraw()
+        if self.on_change:
+            self.on_change(self.value, False)
+
+    def _on_drag(self, event):
+        if not self._dragging:
+            return
+        self.value = self._value_from_x(event.x)
+        self.redraw()
+        if self.on_change:
+            self.on_change(self.value, False)
+
+    def _on_release(self, event):
+        self._dragging = False
+        if self.on_release:
+            self.on_release(self.value)
+
+    def set_value(self, value, redraw=True):
+        self.value = max(0, min(100, value))
+        if redraw:
+            self.redraw()
+
+    def redraw(self):
+        for item in self._items:
+            self.canvas.delete(item)
+        self._items.clear()
+
+        track_y1 = self.y + self.height / 2 - 4
+        track_y2 = self.y + self.height / 2 + 4
+        track_x1 = self.x + self._thumb_r
+        track_x2 = self.x + self.width - self._thumb_r
+
+        self._items.append(_rounded_rect(
+            self.canvas, track_x1, track_y1, track_x2, track_y2, 4,
+            fill=COLOR_TRACK, outline=""
+        ))
+
+        fill_x = track_x1 + (track_x2 - track_x1) * (self.value / 100)
+        if fill_x > track_x1 + 1:
+            self._items.append(_rounded_rect(
+                self.canvas, track_x1, track_y1, fill_x, track_y2, 4,
+                fill=COLOR_ACCENT, outline=""
+            ))
+
+        thumb_cx = fill_x
+        thumb_cy = self.y + self.height / 2
+        r = self._thumb_r
+        self._items.append(self.canvas.create_oval(
+            thumb_cx - r, thumb_cy - r, thumb_cx + r, thumb_cy + r,
+            fill=COLOR_TEXT_MAIN, outline=COLOR_ACCENT, width=2
+        ))
+
+        # ヒット領域(操作対象)を最前面に上げ直す
+        self.canvas.tag_raise(self._hit_id)
+
+
+# ----------------------------------------------------------------------
+# クリックで開くスライダーパネル
+# ----------------------------------------------------------------------
+
+class SliderPanel:
+    ROW_HEIGHT = 46
+    PADDING = 18
+
+    def __init__(self, root):
+        self.root = root
+        self.window = None
+        self.canvas = None
+        self.sliders = []
+        self.value_labels = []
+        self.snapshot = []
+
+    def _apply_brightness(self, monitor_index, value, is_final, link_sliders):
+        settings = load_config()
+        delay_mode = settings.get("delay_until_release", "0") == "1"
+
+        if delay_mode and not is_final:
+            return  # 「止まるまで変更を遅らせる」がONの間はドラッグ中は反映しない
+
+        try:
+            new_value = set_monitor_brightness(monitor_index, value)
+        except Exception as e:
+            log_error("panel_set_brightness", e)
+            return
+
+        if link_sliders:
+            self._sync_linked_sliders(monitor_index, new_value, is_final, delay_mode)
+
+        if is_final and settings.get("show_toast_after", "1") == "1":
+            from_toast = getattr(self.root, "_toast_manager", None)
+            if from_toast:
+                from_toast.show(new_value)
+
+    def _sync_linked_sliders(self, source_index, source_value, is_final, delay_mode):
+        for m, slider, label in zip(self.snapshot, self.sliders, self.value_labels):
+            if m["index"] == source_index:
+                continue
+            slider.set_value(source_value)
+            if label is not None:
+                label.configure(text=f"{int(round(source_value))}%")
+            if not delay_mode or is_final:
+                try:
+                    set_monitor_brightness(m["index"], source_value)
+                except Exception as e:
+                    log_error("panel_set_brightness_linked", e)
+
+    def toggle(self):
+        if self.window is not None and self.window.winfo_viewable():
+            self.close()
+        else:
+            self.open()
+
+    def open(self):
+        self.close()
+        settings = load_config()
+        large = settings.get("large_slider", "0") == "1"
+        show_number = settings.get("show_number", "1") == "1"
+        link_sliders = settings.get("link_sliders", "0") == "1"
+
+        self.snapshot = get_monitor_snapshot()
+
+        row_h = self.ROW_HEIGHT + (14 if large else 0)
+        slider_h = 18 if large else 12
+        width = 340
+        rows = max(1, len(self.snapshot))
+        height = self.PADDING * 2 + rows * row_h + (30 if not self.snapshot else 0)
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=COLOR_BORDER)
+
+        outer = tk.Frame(win, bg=COLOR_BORDER)
+        outer.pack(padx=1, pady=1)
+        canvas = tk.Canvas(outer, width=width, height=height, bg=COLOR_PANEL,
+                            highlightthickness=0)
+        canvas.pack()
+
+        self.window = win
+        self.canvas = canvas
+        self.sliders = []
+        self.value_labels = []
+
+        if not self.snapshot:
+            canvas.create_text(
+                width / 2, height / 2, text="DDC/CI対応モニターが見つかりません",
+                fill=COLOR_TEXT_SUB, font=FONT_BODY
+            )
+        else:
+            for i, m in enumerate(self.snapshot):
+                row_y = self.PADDING + i * row_h
+                name = m["name"]
+                display_name = name if len(name) <= 22 else name[:20] + "..."
+                canvas.create_text(
+                    self.PADDING, row_y, anchor="nw", text=display_name,
+                    fill=COLOR_TEXT_MAIN, font=FONT_BODY
+                )
+
+                value_label = None
+                label_w = 0
+                if show_number:
+                    label_w = 40
+                    value_label = tk.Label(
+                        win, text=f"{m['brightness'] or 0}%", font=FONT_MONO,
+                        fg=COLOR_ACCENT, bg=COLOR_PANEL
+                    )
+                    canvas.create_window(
+                        width - self.PADDING, row_y + 20, anchor="ne", window=value_label
+                    )
+
+                slider_y = row_y + 22
+                slider_width = width - self.PADDING * 2 - label_w - (8 if show_number else 0)
+
+                def on_change(value, is_final, index=m["index"], label=value_label):
+                    if label is not None:
+                        label.configure(text=f"{int(round(value))}%")
+                    self._apply_brightness(index, value, is_final, link_sliders)
+
+                def on_release(value, index=m["index"], label=value_label):
+                    if label is not None:
+                        label.configure(text=f"{int(round(value))}%")
+                    self._apply_brightness(index, value, True, link_sliders)
+
+                slider = ModernSlider(
+                    canvas, self.PADDING, slider_y, slider_width, slider_h,
+                    value=m["brightness"] or 0, on_change=on_change, on_release=on_release
+                )
+                self.sliders.append(slider)
+                self.value_labels.append(value_label)
+
+        win.update_idletasks()
+        try:
+            left, top, right, bottom = _active_monitor_work_area()
+        except Exception:
+            right, bottom = win.winfo_screenwidth(), win.winfo_screenheight()
+        win_w = win.winfo_reqwidth()
+        win_h = win.winfo_reqheight()
+        x = right - win_w - 8
+        y = bottom - win_h - 8
+        win.geometry(f"{win_w}x{win_h}+{x}+{y}")
+
+        win.bind("<FocusOut>", lambda e: self.root.after(120, self._close_if_unfocused))
+        win.focus_force()
+
+    def _close_if_unfocused(self):
+        if self.window is None:
+            return
+        try:
+            focused = self.window.focus_get()
+        except Exception:
+            focused = None
+        if focused is None:
+            self.close()
+
+    def close(self):
+        if self.window is not None:
+            try:
+                self.window.destroy()
+            except Exception:
+                pass
+            self.window = None
+            self.canvas = None
+            self.sliders = []
+            self.value_labels = []
+
+
+# ----------------------------------------------------------------------
+# トースト通知(スライダー操作後に現在値を表示。AudioSwitcherと同じ仕組み)
+# ----------------------------------------------------------------------
+
+class ToastManager:
+    WIDTH, HEIGHT = 260, 60
 
     def __init__(self, root):
         self.root = root
@@ -213,15 +539,15 @@ class _ToastManager:
         self.window = toast
         self.canvas = canvas
 
-    def _place_bottom_right(self):
+    def _place(self):
         try:
             left, top, right, bottom = _active_monitor_work_area()
         except Exception:
             left, top = 0, 0
             right = self.window.winfo_screenwidth()
             bottom = self.window.winfo_screenheight()
-        x = right - self.WIDTH - 6
-        y = bottom - self.HEIGHT - 6
+        x = right - self.WIDTH - 8
+        y = bottom - self.HEIGHT - 8
         self.window.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
 
     def show(self, brightness_percent):
@@ -232,41 +558,31 @@ class _ToastManager:
 
         canvas = self.canvas
         canvas.delete("all")
-        _rounded_rect(canvas, 1, 1, self.WIDTH - 1, self.HEIGHT - 1, 16,
+        _rounded_rect(canvas, 1, 1, self.WIDTH - 1, self.HEIGHT - 1, 14,
                       fill=COLOR_PANEL, outline=COLOR_BORDER, width=1)
-        canvas.create_rectangle(0, 12, 4, self.HEIGHT - 12, fill=COLOR_ACCENT, outline="")
-        canvas.create_text(22, 20, anchor="w", text="BRIGHTNESS",
+        canvas.create_rectangle(0, 10, 4, self.HEIGHT - 10, fill=COLOR_ACCENT, outline="")
+        canvas.create_text(20, 18, anchor="w", text="BRIGHTNESS",
                             fill=COLOR_ACCENT, font=("Segoe UI", 8, "bold"))
-        canvas.create_text(22, 42, anchor="w", text=f"{brightness_percent}%",
-                            fill=COLOR_TEXT_MAIN, font=("Segoe UI", 14, "bold"))
+        canvas.create_text(20, 38, anchor="w", text=f"{int(round(brightness_percent))}%",
+                            fill=COLOR_TEXT_MAIN, font=("Segoe UI", 13, "bold"))
 
-        # 明るさを表す横棒インジケーター
-        bar_x1, bar_x2 = 130, self.WIDTH - 22
-        bar_y1, bar_y2 = 36, 44
-        _rounded_rect(canvas, bar_x1, bar_y1, bar_x2, bar_y2, 4,
-                      fill=COLOR_INPUT, outline=COLOR_BORDER, width=1)
-        fill_width = (bar_x2 - bar_x1) * max(0, min(100, brightness_percent)) / 100
-        if fill_width > 2:
-            _rounded_rect(canvas, bar_x1, bar_y1, bar_x1 + fill_width, bar_y2, 4,
-                          fill=COLOR_ACCENT, outline="")
-
-        self._place_bottom_right()
+        self._place()
         self.window.deiconify()
-        self._place_bottom_right()
+        self._place()
         self.current_alpha = 0.0
         self._fade_in()
 
     def _fade_in(self):
         if self.current_alpha < 0.96:
-            self.current_alpha += 0.12
+            self.current_alpha += 0.14
             self.window.attributes("-alpha", min(self.current_alpha, 0.96))
             self.fade_job = self.root.after(15, self._fade_in)
         else:
-            self.fade_job = self.root.after(2000, self._fade_out)
+            self.fade_job = self.root.after(1600, self._fade_out)
 
     def _fade_out(self):
         if self.current_alpha > 0.0:
-            self.current_alpha -= 0.06
+            self.current_alpha -= 0.07
             self.window.attributes("-alpha", max(self.current_alpha, 0.0))
             self.fade_job = self.root.after(15, self._fade_out)
         else:
@@ -274,420 +590,91 @@ class _ToastManager:
             self.fade_job = None
 
 
-_toast_queue = queue.Queue()
+# ----------------------------------------------------------------------
+# トレイアイコン + 右クリックメニュー
+#
+# pystrayのアイコンはメッセージポンプを持つ独自のイベントループを回すため、
+# Tkinterのmainloopとは別スレッドで動かす。トレイ側のコールバックは
+# pystrayのスレッドで呼ばれるので、Tk操作はすべてキュー経由でmainloopに戻す
+# (AudioSwitcherでホットキーのコールバックを軽量に保った時と同じ考え方)。
+# ----------------------------------------------------------------------
+
+_ui_action_queue = queue.Queue()
 
 
-def log_error(context, exc):
-    """サイレントに握りつぶさず、原因調査用にエラーをログファイルへ記録する"""
-    try:
-        log_path = os.path.join(BASE_DIR, "error.log")
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {context}: {repr(exc)}\n")
-            if exc is not None and exc.__traceback__ is not None:
-                import traceback
-                f.write("".join(traceback.format_tb(exc.__traceback__)))
-    except Exception:
-        pass
+def _build_menu():
+    settings = load_config()
+
+    def is_on(key):
+        return load_config().get(key, "0") == "1"
+
+    def toggle(key):
+        def _handler(icon, item):
+            current = load_config()
+            current[key] = "0" if current.get(key, "0") == "1" else "1"
+            save_config(current)
+            if key == "startup":
+                manage_startup(current[key] == "1")
+        return _handler
+
+    def on_open_panel(icon, item):
+        _ui_action_queue.put(("open_panel", None))
+
+    def on_quit(icon, item):
+        _ui_action_queue.put(("quit", None))
+
+    return pystray.Menu(
+        pystray.MenuItem("open", on_open_panel, default=True, visible=False),
+        pystray.MenuItem("サインイン時に起動する", toggle("startup"), checked=lambda i: is_on("startup")),
+        pystray.MenuItem("大きいスライダーを使う", toggle("large_slider"), checked=lambda i: is_on("large_slider")),
+        pystray.MenuItem("調整後の明るさを表示する", toggle("show_toast_after"), checked=lambda i: is_on("show_toast_after")),
+        pystray.MenuItem("現在の数字を表示する", toggle("show_number"), checked=lambda i: is_on("show_number")),
+        pystray.MenuItem("止まるまで変更を遅らせる", toggle("delay_until_release"), checked=lambda i: is_on("delay_until_release")),
+        pystray.MenuItem("一斉に動かせるようにする", toggle("link_sliders"), checked=lambda i: is_on("link_sliders")),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("終了", on_quit),
+    )
 
 
-def _log_thread_exception(args):
-    log_error(f"thread:{args.thread.name if args.thread else '?'}", args.exc_value)
+def run_app():
+    kill_previous_instances()
 
-
-threading.excepthook = _log_thread_exception
-
-
-# AudioSwitcherで踏んだ不具合(低レベルキーボードフックのコールバック内で
-# 重い処理をブロッキングで行うと、Windowsがそのフックを黙って無効化し
-# ホットキーが反応しなくなることがある)を教訓に、ホットキーのコールバックは
-# デバウンス判定とキューへの投入だけに留め、実際のDDC/CI通信は別スレッドの
-# ワーカーに任せる。
-_adjust_request_queue = queue.Queue()
-
-
-def _make_hotkey_callback(direction):
-    def _callback():
-        global last_adjust_time
-        current_time = time.time()
-        if current_time - last_adjust_time < 0.35:
-            return
-        last_adjust_time = current_time
-        _adjust_request_queue.put(direction)
-    return _callback
-
-
-brightness_up = _make_hotkey_callback(+1)
-brightness_down = _make_hotkey_callback(-1)
-
-
-def _adjust_worker():
-    """キューに積まれた上げ/下げ要求を、フックコールバックの外側で実処理する。
-    DDC/CI通信(I2C経由)は遅いモニターだと数十〜百msかかることがあるが、
-    ここで時間を使ってもキーボードフックの応答性には影響しない。"""
-    _, _, step_str, _ = load_config()
-    while True:
-        direction = _adjust_request_queue.get()
-        try:
-            _, _, step_str, _ = load_config()
-            try:
-                step = int(step_str)
-            except ValueError:
-                step = int(DEFAULT_STEP)
-
-            snapshot = get_monitor_snapshot()
-            if not snapshot:
-                continue
-
-            new_values = []
-            for m in snapshot:
-                if m["brightness"] is None:
-                    continue
-                target = m["brightness"] + direction * step
-                try:
-                    new_value = set_monitor_brightness(m["index"], target)
-                    new_values.append(new_value)
-                except Exception as e:
-                    log_error(f"set_brightness[{m['index']}]", e)
-
-            if new_values:
-                avg = round(sum(new_values) / len(new_values))
-                _toast_queue.put(avg)
-        except Exception as e:
-            log_error("adjust_worker", e)
-
-
-def _rehook_watchdog(hotkey_up, hotkey_down, interval_sec=300):
-    """他アプリのグローバルフックとの競合でkeyboardライブラリの内部状態が
-    ズレてホットキーが反応しなくなる既知の問題への対策(AudioSwitcherと同じ)。"""
-    while True:
-        time.sleep(interval_sec)
-        try:
-            keyboard.unhook_all()
-            keyboard.add_hotkey(hotkey_up, brightness_up, trigger_on_release=False)
-            keyboard.add_hotkey(hotkey_down, brightness_down, trigger_on_release=False)
-        except Exception as e:
-            log_error("rehook_watchdog", e)
-
-
-def start_backend():
-    """バックグラウンドでのキーボード監視 + 常駐トースト用Tkループの開始"""
-    hotkey_up, hotkey_down, _, _ = load_config()
-    keyboard.add_hotkey(hotkey_up, brightness_up, trigger_on_release=False)
-    keyboard.add_hotkey(hotkey_down, brightness_down, trigger_on_release=False)
-    threading.Thread(target=_rehook_watchdog, args=(hotkey_up, hotkey_down), daemon=True).start()
-    threading.Thread(target=_adjust_worker, daemon=True).start()
+    settings = load_config()
+    if not os.path.exists(CONFIG_FILE):
+        save_config(settings)
 
     root = tk.Tk()
     root.withdraw()
     root.report_callback_exception = lambda exc_type, exc_value, tb: log_error("tk_callback", exc_value)
-    toast_manager = _ToastManager(root)
 
-    def poll_toast_queue():
+    toast_manager = ToastManager(root)
+    root._toast_manager = toast_manager  # SliderPanelから参照するため
+    panel = SliderPanel(root)
+
+    tray_icon = pystray.Icon("BrightSwitch", render_tray_icon(), "BrightSwitch", _build_menu())
+
+    def poll_ui_queue():
         try:
             while True:
-                brightness_percent = _toast_queue.get_nowait()
-                toast_manager.show(brightness_percent)
+                action, payload = _ui_action_queue.get_nowait()
+                if action == "open_panel":
+                    panel.toggle()
+                elif action == "quit":
+                    tray_icon.stop()
+                    root.after(50, root.destroy)
         except queue.Empty:
             pass
-        except Exception as e:
-            log_error("poll_toast_queue", e)
-        root.after(50, poll_toast_queue)
+        root.after(50, poll_ui_queue)
 
-    root.after(50, poll_toast_queue)
-    root.mainloop()
+    root.after(50, poll_ui_queue)
 
-
-class _HotkeyRecorder:
-    """1つのCTkEntryに対する「クリックしてキーを押すと記録」の挙動をまとめたヘルパー。
-    設定画面でホットキー入力欄が2つ(明るく/暗く)必要になったため、
-    AudioSwitcherではその場のクロージャで書いていたロジックをクラスに切り出した。"""
-
-    def __init__(self, entry, initial_value):
-        self.entry = entry
-        self.saved_value = initial_value
-        self.temp_value = initial_value
-        self.is_recording = False
-        self.current_keys = set()
-
-        entry.configure(state="normal")
-        entry.insert(0, initial_value)
-        entry.configure(state="readonly")
-        entry.bind("<FocusIn>", self._on_focus_in)
-        entry.bind("<FocusOut>", self._on_focus_out)
-        entry.bind("<KeyPress>", self._on_key_press)
-        entry.bind("<KeyRelease>", self._on_key_release)
-
-    def _set_text(self, text, color=None):
-        self.entry.configure(state="normal")
-        self.entry.delete(0, "end")
-        self.entry.insert(0, text)
-        if color:
-            self.entry.configure(text_color=color)
-        self.entry.configure(state="readonly")
-
-    def _on_focus_in(self, _event):
-        self.is_recording = True
-        self.current_keys.clear()
-        self._set_text("Press Keys...", color=COLOR_ACCENT)
-
-    def _on_focus_out(self, _event):
-        self.is_recording = False
-        self.entry.configure(text_color=COLOR_TEXT_MAIN)
-        if self.temp_value == "Press Keys..." or not self.temp_value:
-            self.temp_value = self.saved_value
-        self._set_text(self.temp_value)
-
-    def _on_key_press(self, event):
-        if not self.is_recording:
-            return "break"
-        if event.keysym == "Escape":
-            self.temp_value = self.saved_value
-            self.entry.master.focus_set()
-            return "break"
-        key_map = {
-            "Control_L": "ctrl", "Control_R": "ctrl", "Alt_L": "alt", "Alt_R": "alt",
-            "Shift_L": "shift", "Shift_R": "shift", "Win_L": "win", "Win_R": "win",
-            "Up": "up", "Down": "down", "Left": "left", "Right": "right",
-        }
-        key_name = key_map.get(event.keysym, event.keysym.lower())
-        if "caps" in key_name or "lock" in key_name or "num_" in key_name:
-            return "break"
-        self.current_keys.add(key_name)
-
-        ordered = []
-        for modifier in ["ctrl", "alt", "shift", "win"]:
-            if modifier in self.current_keys:
-                ordered.append(modifier)
-        for k in sorted(self.current_keys):
-            if k not in ["ctrl", "alt", "shift", "win"]:
-                ordered.append(k)
-        self.temp_value = "+".join(ordered)
-        self._set_text(self.temp_value)
-        return "break"
-
-    def _on_key_release(self, _event):
-        if not self.is_recording:
-            return "break"
-        if self.temp_value and self.temp_value != "Press Keys...":
-            self.is_recording = False
-            self.entry.master.focus_set()
-        return "break"
-
-    @property
-    def value(self):
-        return self.temp_value
-
-
-def open_setting_window():
-    """2重起動防止付き設定UI。モニター一覧をスライダーで直接調整でき、
-    明るく/暗くの2つのホットキーとステップ幅を設定できる。"""
-    import customtkinter as ctk
-
-    kill_previous_instances()
-
-    snapshot = get_monitor_snapshot()
-    saved_up, saved_down, saved_step, saved_startup = load_config()
-
-    ctk.set_appearance_mode("dark")
-
-    root = ctk.CTk(fg_color=COLOR_BG)
-    root.title("BrightSwitch")
-    root.geometry("560x100")
-    root.resizable(False, False)
-    root.attributes("-topmost", True)
-    if os.path.exists(ICON_PATH):
-        try:
-            root.iconbitmap(ICON_PATH)
-        except Exception:
-            pass
-
-    header = ctk.CTkFrame(root, fg_color="transparent")
-    header.pack(fill="x", padx=30, pady=(30, 18))
-    ctk.CTkLabel(header, text="BrightSwitch", font=FONT_DISPLAY,
-                 text_color=COLOR_TEXT_MAIN, anchor="w").pack(fill="x")
-    ctk.CTkLabel(header, text="モニターの明るさをワンショートカットで調整する。",
-                 font=FONT_BODY, text_color=COLOR_TEXT_SUB, anchor="w").pack(fill="x", pady=(2, 0))
-
-    if not snapshot:
-        warn = ctk.CTkFrame(root, fg_color=COLOR_PANEL, corner_radius=14,
-                             border_width=1, border_color=COLOR_BORDER)
-        warn.pack(fill="x", padx=30, pady=(0, 18))
-        ctk.CTkLabel(
-            warn, text="DDC/CI対応モニターが見つかりませんでした。\nモニターのOSD設定でDDC/CIを有効にしてください。",
-            font=FONT_BODY, text_color=COLOR_TEXT_SUB, justify="left"
-        ).pack(padx=20, pady=16)
-
-    # モニター一覧 + 明るさスライダー
-    monitor_panel = ctk.CTkFrame(root, fg_color=COLOR_PANEL, corner_radius=14,
-                                  border_width=1, border_color=COLOR_BORDER)
-    monitor_panel.pack(fill="x", padx=30, pady=(0, 18))
-
-    ctk.CTkLabel(monitor_panel, text="MONITORS", font=FONT_LABEL, text_color=COLOR_TEXT_SUB,
-                 anchor="w").pack(fill="x", padx=20, pady=(16, 4))
-
-    def make_slider_row(parent, monitor):
-        row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=20, pady=6)
-
-        name = monitor["name"]
-        label = ctk.CTkLabel(row, text=name, font=FONT_BODY, text_color=COLOR_TEXT_MAIN,
-                              anchor="w", width=180)
-        label.pack(side="left")
-
-        value_label = ctk.CTkLabel(row, text="--", font=FONT_MONO, text_color=COLOR_ACCENT, width=44)
-        value_label.pack(side="right")
-
-        current = monitor["brightness"] if monitor["brightness"] is not None else 50
-
-        def on_slider_release(_value, index=monitor["index"]):
-            try:
-                new_value = set_monitor_brightness(index, slider.get())
-                value_label.configure(text=f"{new_value}%")
-            except Exception as e:
-                log_error("slider_set_brightness", e)
-
-        slider = ctk.CTkSlider(
-            row, from_=0, to=100, number_of_steps=100,
-            fg_color=COLOR_INPUT, progress_color=COLOR_ACCENT,
-            button_color=COLOR_TEXT_MAIN, button_hover_color=COLOR_ACCENT_HOVER,
-        )
-        slider.pack(side="left", fill="x", expand=True, padx=12)
-        slider.set(current)
-        value_label.configure(text=f"{current}%")
-        slider.bind("<ButtonRelease-1>", lambda e: on_slider_release(slider.get()))
-
-    if snapshot:
-        for m in snapshot:
-            make_slider_row(monitor_panel, m)
-    ctk.CTkLabel(monitor_panel, text="", height=4).pack()
-
-    # ホットキー・ステップ幅
-    container = ctk.CTkFrame(root, fg_color=COLOR_PANEL, corner_radius=14,
-                              border_width=1, border_color=COLOR_BORDER)
-    container.pack(fill="both", expand=True, padx=30, pady=0)
-
-    def section_label(parent, text):
-        ctk.CTkLabel(parent, text=text, font=FONT_LABEL, text_color=COLOR_TEXT_SUB,
-                     anchor="w").pack(fill="x", padx=24, pady=(18, 6))
-
-    entry_kwargs = dict(
-        font=FONT_MONO, justify="center", state="readonly",
-        fg_color=COLOR_INPUT, text_color=COLOR_TEXT_MAIN,
-        border_width=0, corner_radius=8,
-    )
-
-    hotkey_row = ctk.CTkFrame(container, fg_color="transparent")
-    hotkey_row.pack(fill="x", padx=24, pady=(0, 6))
-
-    up_col = ctk.CTkFrame(hotkey_row, fg_color="transparent")
-    up_col.pack(side="left", fill="x", expand=True, padx=(0, 8))
-    ctk.CTkLabel(up_col, text="明るく", font=("Segoe UI", 8), text_color=COLOR_TEXT_FAINT,
-                 anchor="w").pack(fill="x")
-    up_box = ctk.CTkFrame(up_col, fg_color=COLOR_INPUT, corner_radius=8,
-                           border_width=1, border_color=COLOR_BORDER)
-    up_box.pack(fill="x", pady=(2, 0))
-    entry_up = ctk.CTkEntry(up_box, **entry_kwargs)
-    entry_up.pack(fill="x", padx=2, pady=2, ipady=6)
-
-    down_col = ctk.CTkFrame(hotkey_row, fg_color="transparent")
-    down_col.pack(side="left", fill="x", expand=True, padx=(8, 0))
-    ctk.CTkLabel(down_col, text="暗く", font=("Segoe UI", 8), text_color=COLOR_TEXT_FAINT,
-                 anchor="w").pack(fill="x")
-    down_box = ctk.CTkFrame(down_col, fg_color=COLOR_INPUT, corner_radius=8,
-                             border_width=1, border_color=COLOR_BORDER)
-    down_box.pack(fill="x", pady=(2, 0))
-    entry_down = ctk.CTkEntry(down_box, **entry_kwargs)
-    entry_down.pack(fill="x", padx=2, pady=2, ipady=6)
-
-    recorder_up = _HotkeyRecorder(entry_up, saved_up)
-    recorder_down = _HotkeyRecorder(entry_down, saved_down)
-
-    ctk.CTkLabel(container, text="クリックしてから新しいキーの組み合わせを押すと変更できます",
-                 font=("Segoe UI", 8), text_color=COLOR_TEXT_FAINT, anchor="w").pack(
-        fill="x", padx=24, pady=(4, 14))
-
-    section_label(container, "STEP (1回のホットキーで変化させる%)")
-    step_var = tk.StringVar(value=saved_step)
-    step_entry = ctk.CTkEntry(
-        container, textvariable=step_var, font=FONT_MONO, justify="center",
-        fg_color=COLOR_INPUT, text_color=COLOR_TEXT_MAIN, border_width=1,
-        border_color=COLOR_BORDER, corner_radius=8,
-    )
-    step_entry.pack(fill="x", padx=24, pady=(0, 20))
-
-    # ボトム
-    bottom_bar = ctk.CTkFrame(root, fg_color="transparent")
-    bottom_bar.pack(fill="x", padx=30, pady=(18, 30))
-
-    startup_var = tk.StringVar(value=saved_startup)
-    switch_startup = ctk.CTkSwitch(
-        bottom_bar, text="Start on boot", variable=startup_var, onvalue="1", offvalue="0",
-        font=FONT_BODY, text_color=COLOR_TEXT_SUB,
-        fg_color=COLOR_INPUT, progress_color=COLOR_ACCENT,
-        button_color=COLOR_TEXT_MAIN, button_hover_color=COLOR_ACCENT_HOVER,
-    )
-    switch_startup.pack(side="left", anchor="w")
-
-    btn_frame = ctk.CTkFrame(bottom_bar, fg_color="transparent")
-    btn_frame.pack(side="right")
-
-    def validated_step():
-        try:
-            step = int(step_var.get())
-            if step <= 0 or step > 100:
-                raise ValueError
-            return str(step)
-        except ValueError:
-            tk.messagebox.showwarning("Invalid Step", "STEPには1〜100の整数を入力してください。")
-            return None
-
-    def on_save_only():
-        step = validated_step()
-        if step is None:
-            return
-        save_config(recorder_up.value, recorder_down.value, step, startup_var.get())
-        root.destroy()
-        sys.exit(0)
-
-    btn_save_only = ctk.CTkButton(
-        btn_frame, text="Save only", command=on_save_only,
-        fg_color="transparent", hover_color=COLOR_INPUT, text_color=COLOR_TEXT_SUB,
-        border_width=1, border_color=COLOR_BORDER, corner_radius=8,
-        font=FONT_LABEL, width=100, height=36,
-    )
-    btn_save_only.pack(side="left", padx=(0, 10))
-
-    def on_save_and_run():
-        step = validated_step()
-        if step is None:
-            return
-        save_config(recorder_up.value, recorder_down.value, step, startup_var.get())
-        root.destroy()
-        start_backend()
-
-    btn_save_run = ctk.CTkButton(
-        btn_frame, text="Save & Run", command=on_save_and_run,
-        fg_color=COLOR_ACCENT, hover_color=COLOR_ACCENT_HOVER, text_color=COLOR_BG,
-        corner_radius=8, font=FONT_LABEL, width=120, height=36,
-    )
-    btn_save_run.pack(side="right")
-
-    root.update_idletasks()
-    required_height = root.winfo_reqheight() + 12
-    root.geometry(f"560x{required_height}")
-
+    threading.Thread(target=tray_icon.run, daemon=True).start()
     root.mainloop()
 
 
 if __name__ == "__main__":
     try:
-        if "/background" in sys.argv:
-            if os.path.exists(CONFIG_FILE):
-                start_backend()
-            else:
-                open_setting_window()
-        else:
-            open_setting_window()
+        run_app()
     except SystemExit:
         raise
     except Exception as e:

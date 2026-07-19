@@ -1,78 +1,72 @@
 # Lumina
 
-Windows用の常駐型モニター明るさ調整ツールです。
-タスクバー右下(通知領域)のアイコンをクリックすると、接続中の各モニターの明るさを
-モダンなスライダーで直接調整できます。
+A resident monitor brightness controller for Windows.
+Click the icon in the taskbar's notification area to adjust the brightness of every connected monitor directly, with a modern slider panel.
 
-- タスクバーのアイコンをクリック → 各モニターの明るさスライダーがその場にふわっと開く
-- アイコンを右クリック → 表示方法・挙動をON/OFFで切り替えられる設定メニュー
-- DDC/CI対応の複数モニターをそれぞれ独立して調整。「一斉に動かせるようにする」を
-  ONにするとマスターフェーダーが追加され、そこから全モニターをまとめて動かせる
-  (個別スライダーは常に独立して動く)
-- 調整後にはトースト通知で現在の明るさを表示(設定でON/OFF可、既定はOFF)
+- Click the taskbar icon → a brightness slider panel for every monitor pops open right there
+- Right-click the icon → a settings menu with checkable toggles for behavior and display options
+- Adjust DDC/CI-capable monitors independently. Turning on "Link sliders together" adds a master fader
+  that moves every monitor at once (individual sliders always keep moving independently either way)
+- Optionally shows a toast notification with the current brightness after adjusting (off by default)
 
-## 対応環境
+## Requirements
 
 - Windows 10 / 11
-- DDC/CI対応モニター(HDMI/DisplayPort接続の外部モニターの多くが対応)。
-  ノートPCの内蔵ディスプレイはWindows標準の明るさ調整を使ってください(DDC/CI非対応)。
-- お使いのモニターがDDC/CIに対応していない場合、パネルに「DDC/CI対応モニターが
-  見つかりません」と表示されます。モニターのOSDメニューでDDC/CIを有効にできる
-  場合があります。
+- A DDC/CI-capable monitor (most external monitors connected via HDMI/DisplayPort support this).
+  Laptop built-in displays should use Windows' own brightness control instead (no DDC/CI support).
+- If your monitor doesn't support DDC/CI, the panel will show "No DDC/CI-capable monitors found."
+  Some monitors let you enable DDC/CI from their OSD menu.
 
-## 使い方
+## Usage
 
-### 1. 起動
+### 1. Launch
 
-`Lumina.exe`(または`python lumina.py`)を起動すると、タスクバー右下の通知領域に
-太陽アイコンが常駐します。ウィンドウは表示されません。
+Run `Lumina.exe` (or `python lumina.py`) and a sun icon appears in the taskbar's notification area. No window is shown.
 
-### 2. 明るさを変える
+### 2. Adjust brightness
 
-通知領域のアイコンを**左クリック**すると、画面右下に各モニターのスライダーが
-並んだパネルがフェード+スライドしながら開きます。スライダーをドラッグすると
-明るさが変わります。パネル右上の✕、またはパネルの外側をクリックすると閉じます。
+**Left-click** the tray icon to open a panel with one slider per monitor, fading and sliding into place in the
+bottom-right corner. Drag a slider to change brightness. Click the ✕ in the top-right of the panel, or click
+outside it, to close it.
 
-「一斉に動かせるようにする」がONの場合、パネル上部に「すべてのモニター」という
-マスターフェーダーが追加されます。これを動かすと全モニターが同じ値に揃います。
-個別モニターのスライダーはこの設定に関係なく、常にそのモニターだけを独立して
-動かせます。
+When "Link sliders together" is on, a master fader labeled "All Monitors" is added at the top of the panel.
+Moving it brings every monitor to the same value. Individual monitor sliders always move independently
+regardless of this setting.
 
-### 3. 設定を変える
+### 3. Change settings
 
-通知領域のアイコンを**右クリック**すると設定メニューが開きます。全てON/OFFの
-トグルで、その場でチェックが切り替わります(保存ボタンなどは不要)。
+**Right-click** the tray icon to open the settings menu. Every option is a checkable toggle that applies
+immediately (no save button needed).
 
-| 項目 | 内容 |
+| Option | Description |
 |---|---|
-| サインイン時に起動する | Windows起動時に自動でLuminaを立ち上げる |
-| 調整後の明るさを表示する | スライダーから指を離した時にトースト通知を出す(既定OFF) |
-| 現在の数字を表示する | パネルに各モニターの明るさを%表示する |
-| 止まるまで変更を遅らせる | ONにするとドラッグ中は反映せず、指を離した時だけ実際に明るさを変更する(OFFの場合はドラッグ中も逐次反映) |
-| 一斉に動かせるようにする | ONにするとパネルにマスターフェーダーが追加され、そこから全モニターをまとめて動かせる |
-| タスクバーの表示設定を開く... | Windowsの「タスクバー設定」を直接開くショートカット。下記の注意点を参照 |
+| Launch at sign-in | Automatically start Lumina when Windows boots |
+| Show brightness after adjusting | Show a toast notification when you release a slider (off by default) |
+| Show current number | Display each monitor's brightness as a percentage in the panel |
+| Delay change until stopped | When on, dragging doesn't apply until you release; when off, brightness updates live while dragging |
+| Link sliders together | Adds a master fader to the panel that moves every monitor at once |
+| Open taskbar display settings... | Shortcut straight to Windows' taskbar settings. See the note below |
 
-### 4. 終了方法
+### 4. Quitting
 
-通知領域のアイコンを右クリックし、「終了」を選択してください。
+Right-click the tray icon and choose "Exit".
 
-## タスクバーへの「常時表示」について
+## About "always show" in the taskbar
 
-通知領域のアイコンをタスクバーに常に表示させるか、隠れている(^)アイコンの中に
-しまうかは、**Windows自身がアプリごとに管理していて、アプリ側から強制するAPIは
-用意されていません**(Vista以降の仕様)。「タスクバーの表示設定を開く...」メニューで
-Windowsの設定画面(タスクバー→その他のシステムトレイアイコン)を直接開けるので、
-そこでLuminaを「オン」にすると常時表示になります。一度設定すれば、次回以降は
-Windows側が記憶してくれます。
+Whether the notification-area icon is always visible or tucked away under the hidden-icons chevron (^) is
+**managed entirely by Windows on a per-app basis — there's no API for an app to force this itself** (this has
+been the case since Vista). The "Open taskbar display settings..." menu item takes you straight to the
+relevant Windows settings page (Taskbar → Other system tray icons), where turning Lumina "On" makes it
+always visible. Windows remembers that choice going forward.
 
-## 設定ファイル
+## Config files
 
-exeと同じフォルダに以下のファイルが作成されます。
+These files are created next to the exe:
 
-- `app_config.txt` — 上記の設定(`key=value`形式)
-- `error.log` — エラー発生時のログ(トラブル時の調査用)
+- `app_config.txt` — the settings above, in `key=value` format
+- `error.log` — Error log for troubleshooting
 
-## 開発者向け: ソースからのビルド
+## Building from source
 
 ```
 pip install -r requirements.txt
@@ -80,45 +74,37 @@ pip install pyinstaller
 pyinstaller --noconfirm Lumina.spec
 ```
 
-`dist/Lumina.exe` が生成されます。
+This produces `dist/Lumina.exe`.
 
-## 今回スコープに含めなかったもの
+## Out of scope for now
 
-参考にしたアプリ(Twinkle Trayなど)にある以下の機能は、今回は実装していません。
+The following features, present in reference apps like Twinkle Tray, are not implemented:
 
-- **モニター配置に従って並べる**: 物理的なモニター配置とDDC/CI側のモニター
-  列挙順を正しく対応付ける確証が取れなかったため、誤った対応付けをするより
-  実装を見送った
-- **調整可能な幅を変更可能にする**(モニターごとの最小/最大値の制限): 追加UIが
-  必要になるため今回は見送り
-- **コントラストを変更可能にする**: 使用しているライブラリ(`screen_brightness_control`)
-  がコントラスト制御に対応していないため見送り(生のVCP経由で実装は可能だが、
-  別途対応が必要)
+- **Arrange sliders by physical monitor layout**: skipped because there was no reliable way found to map
+  physical monitor position to DDC/CI enumeration order — better to omit it than map it incorrectly
+- **Adjustable per-monitor range limits**: would need extra UI, skipped for now
+- **Contrast control**: the library in use (`screen_brightness_control`) doesn't support it (possible via
+  raw VCP calls, but that would need separate work)
 
-## 設計メモ
+## Design notes
 
-AudioSwitcher(同シリーズの音声出力切り替えツール)と設計方針(常駐+軽量な
-コールバック+ワーカースレッド)は共有しつつ、UIはタスクバー常駐のトレイ
-アイコン中心、配色も「Lumina(光)」らしい深い紫紺+暖色グローの独自トーンに
-作り直した。
+Shares AudioSwitcher's design philosophy (resident process, lightweight callbacks, worker threads) but the
+UI is rebuilt around a tray icon, with its own deep indigo/warm-glow color identity ("Lumina" = light)
+instead of reusing AudioSwitcher's look.
 
-- トレイアイコン(pystray)は専用のメッセージループを持つため、Tkinterの
-  mainloopとは別スレッドで動かしている。トレイ側のコールバック(クリック・
-  メニュー選択)はpystrayのスレッドで呼ばれるため、Tk操作は全てキュー経由で
-  mainloopに戻している
-- パネルのスライダーはTkの標準Scaleウィジェットではなく、Canvasに細身の
-  角丸トラックとアクセントカラーを自前で描画するカスタム実装。ドラッグ中は
-  つまみの周りに疑似的なグロー(背景色へ向けて色をブレンドした同心円)を
-  重ねて光っているように見せている
-- パネルの角丸は、ウィンドウ全体を透過キー色でキーイングし、その上に
-  角丸ポリゴンを描画することで実現している(通常のTk Toplevelは矩形にしか
-  ならないため)
-- Per-Monitor DPI Awarenessを明示的に有効化している。これをしないとTkinter
-  の描画がOSに拡大縮小されて滲む上、マルチモニター環境でGetCursorPos等の
-  物理ピクセル座標とTkの論理座標がズレて、パネルが意図しない位置(左上など)
-  に出ることがあった
-- DDC/CI通信(I2C経由で数十〜百ms程度かかることがある)は、スライダーの
-  ドラッグイベントハンドラの中では直接呼ばず、「各モニターの直近の目標値
-  だけを保持し、別スレッドが空き次第まとめて書き込む」方式(coalescing
-  queue)にしている。これによりドラッグ操作そのものは常に軽く、特に
-  マスターフェーダーで複数モニターを一度に動かしてもカクつかない
+- The tray icon (pystray) runs its own message loop, so it runs on a separate thread from Tkinter's
+  mainloop. Tray-side callbacks (clicks, menu selections) fire on pystray's thread, so all Tk operations
+  are routed back to the mainloop through a queue
+- Panel sliders are a custom Canvas-drawn implementation (rounded track, accent color fill) rather than
+  Tk's stock Scale widget. While dragging, a soft glow (concentric circles blended toward the background
+  color) appears around the thumb
+- The panel's rounded corners are achieved by keying the whole window to a transparent color and drawing a
+  rounded polygon on top (a plain Tk Toplevel is always rectangular otherwise)
+- Per-Monitor DPI Awareness is explicitly enabled. Without it, Tkinter's rendering gets upscaled/blurred by
+  the OS, and on multi-monitor setups the physical-pixel coordinates from GetCursorPos etc. drift out of
+  sync with Tk's logical coordinates — this was the cause of the panel occasionally appearing in the wrong
+  place (e.g. top-left)
+- DDC/CI communication (which can take tens to ~100ms over I2C) is never called directly from a slider's
+  drag handler. Instead, each monitor's latest target value is held in memory and a worker thread writes it
+  out whenever it's free (a coalescing queue). This keeps dragging itself always responsive, even when
+  moving several monitors at once via the master fader.

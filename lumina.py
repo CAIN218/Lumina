@@ -7,6 +7,9 @@ import threading
 import queue
 import ctypes
 import math
+import json
+import urllib.request
+import webbrowser
 import winshell
 from win32com.client import Dispatch
 
@@ -20,6 +23,9 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 CONFIG_FILE = os.path.join(BASE_DIR, "app_config.txt")
+
+__version__ = "1.0.1"
+GITHUB_REPO = "CAIN218/Lumina"
 
 # ----------------------------------------------------------------------
 # デザイントークン — 「Lumina(光)」らしい、深い紫紺の背景に暖色の
@@ -69,6 +75,42 @@ def _log_thread_exception(args):
 
 
 threading.excepthook = _log_thread_exception
+
+
+def _parse_version(tag):
+    """'v1.2.3' -> (1, 2, 3)。数値以外が混ざっていても比較不能で落ちない
+    ように、パースできない要素は0として扱う。"""
+    parts = []
+    for p in tag.lstrip("vV").split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
+
+
+_update_queue = queue.Queue()
+
+def _update_check_loop():
+    """1日1回、GitHubの最新リリースを確認する。バックグラウンドの常駐
+    ツールなので、失敗(オフライン等)は完全に握りつぶし通常動作に一切
+    影響させない。新しいバージョンが見つかった時だけ、トースト表示用の
+    キューに積んでメインスレッド側(poll_ui_queue)に伝える。"""
+    while True:
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "Lumina-update-check"},
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            latest_tag = data.get("tag_name", "")
+            release_url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
+            if latest_tag and _parse_version(latest_tag) > _parse_version(__version__):
+                _update_queue.put((latest_tag, release_url))
+        except Exception as e:
+            log_error("update_check", e)
+        time.sleep(24 * 60 * 60)
 
 
 def enable_dpi_awareness():
@@ -749,6 +791,8 @@ class ToastManager:
         self.canvas = None
         self.fade_job = None
         self.current_alpha = 0.0
+        self.on_click = None
+        self._hold_ms = 1600
 
     def _ensure_window(self):
         if self.window is not None:
@@ -764,6 +808,8 @@ class ToastManager:
         canvas = tk.Canvas(toast, width=self.WIDTH, height=self.HEIGHT,
                             bg=COLOR_TRANSPARENT_KEY, highlightthickness=0)
         canvas.pack(fill="both", expand=True)
+        # クリック可能なトースト(アップデート通知など)用。show()側で都度差し替える。
+        canvas.bind("<Button-1>", lambda e: self.on_click() if self.on_click else None)
         toast.withdraw()
 
         self.window = toast
@@ -790,7 +836,38 @@ class ToastManager:
                             fill=COLOR_ACCENT, font=("Segoe UI", 8, "bold"))
         canvas.create_text(20, 38, anchor="w", text=f"{int(round(brightness_percent))}%",
                             fill=COLOR_TEXT_MAIN, font=("Segoe UI", 13, "bold"))
+        canvas.configure(cursor="")
 
+        self.on_click = None
+        self._hold_ms = 1600
+        self._place()
+        self.window.deiconify()
+        self._place()
+        self.current_alpha = 0.0
+        self._fade_in()
+
+    def show_update_available(self, latest_tag, release_url):
+        """新しいバージョンが見つかった時の控えめな通知。クリックでリリース
+        ページを開く。頻繁に出るものではないので、通常のトーストより長めに
+        表示したままにする。"""
+        self._ensure_window()
+        if self.fade_job:
+            self.root.after_cancel(self.fade_job)
+            self.fade_job = None
+
+        canvas = self.canvas
+        canvas.delete("all")
+        _rounded_rect(canvas, 1, 1, self.WIDTH - 1, self.HEIGHT - 1, 14,
+                      fill=COLOR_PANEL_BG, outline=COLOR_PANEL_BORDER, width=1)
+        canvas.create_rectangle(0, 10, 4, self.HEIGHT - 10, fill=COLOR_ACCENT, outline="")
+        canvas.create_text(20, 18, anchor="w", text="UPDATE AVAILABLE",
+                            fill=COLOR_ACCENT, font=("Segoe UI", 8, "bold"))
+        canvas.create_text(20, 38, anchor="w", text=f"{latest_tag} — click to view",
+                            fill=COLOR_TEXT_MAIN, font=("Segoe UI", 10, "bold"))
+        canvas.configure(cursor="hand2")
+
+        self.on_click = lambda: webbrowser.open(release_url)
+        self._hold_ms = 8000
         self._place()
         self.window.deiconify()
         self._place()
@@ -803,7 +880,7 @@ class ToastManager:
             self.window.attributes("-alpha", min(self.current_alpha, 0.96))
             self.fade_job = self.root.after(15, self._fade_in)
         else:
-            self.fade_job = self.root.after(1600, self._fade_out)
+            self.fade_job = self.root.after(self._hold_ms, self._fade_out)
 
     def _fade_out(self):
         if self.current_alpha > 0.0:
@@ -898,12 +975,23 @@ def run_app():
                     root.after(50, root.destroy)
         except queue.Empty:
             pass
+
+        try:
+            while True:
+                latest_tag, release_url = _update_queue.get_nowait()
+                toast_manager.show_update_available(latest_tag, release_url)
+        except queue.Empty:
+            pass
+        except Exception as e:
+            log_error("poll_update_queue", e)
+
         root.after(50, poll_ui_queue)
 
     root.after(50, poll_ui_queue)
 
     threading.Thread(target=tray_icon.run, daemon=True).start()
     threading.Thread(target=_brightness_writer_worker, daemon=True).start()
+    threading.Thread(target=_update_check_loop, daemon=True).start()
     root.mainloop()
 
 

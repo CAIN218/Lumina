@@ -8,6 +8,7 @@ import queue
 import ctypes
 import math
 import json
+import winreg
 import urllib.request
 import webbrowser
 import winshell
@@ -354,13 +355,38 @@ def _ease_out_cubic(t):
 # 装飾を絞ったフラットデザイン)
 # ----------------------------------------------------------------------
 
+def _taskbar_is_light():
+    """タスクバー(スタートメニュー含む)がWindowsのライトテーマかどうかを
+    レジストリから判定する。読み取りに失敗した場合はダーク扱いにして、
+    従来通りの明るいアイコンにフォールバックする。"""
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+        )
+        value, _ = winreg.QueryValueEx(key, "SystemUsesLightTheme")
+        winreg.CloseKey(key)
+        return value == 1
+    except Exception:
+        return False
+
+
 def render_tray_icon():
+    """タスクバーがライトテーマだと真っ白なアイコンは背景に溶けて見えなく
+    なるため、タスクバーの明暗と逆側の色(ダーク→明るいアイコン、
+    ライト→暗いアイコン)で描き、常にコントラストを確保する。"""
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     cx, cy = size / 2, size / 2
     core_r = 15
-    draw.ellipse([cx - core_r, cy - core_r, cx + core_r, cy + core_r], fill=(242, 236, 225, 255))
+
+    if _taskbar_is_light():
+        icon_color = (27, 21, 49, 255)  # COLOR_PANEL_BGと同じ濃い紫紺
+    else:
+        icon_color = (242, 236, 225, 255)  # 従来の暖色系オフホワイト
+
+    draw.ellipse([cx - core_r, cy - core_r, cx + core_r, cy + core_r], fill=icon_color)
 
     ray_inner, ray_outer, ray_width = core_r + 6, core_r + 15, 5
     for i in range(8):
@@ -369,7 +395,7 @@ def render_tray_icon():
         y1 = cy + ray_inner * math.sin(angle)
         x2 = cx + ray_outer * math.cos(angle)
         y2 = cy + ray_outer * math.sin(angle)
-        draw.line([x1, y1, x2, y2], fill=(242, 236, 225, 255), width=ray_width)
+        draw.line([x1, y1, x2, y2], fill=icon_color, width=ray_width)
     return img
 
 
@@ -384,22 +410,24 @@ class ModernSlider:
     THUMB_R_ACTIVE = 8
 
     def __init__(self, canvas, x, y, width, height, value=50, on_change=None, on_release=None,
-                 panel_bg=COLOR_PANEL_BG):
+                 panel_bg=COLOR_PANEL_BG, disabled=False):
         self.canvas = canvas
         self.x, self.y, self.width, self.height = x, y, width, height
         self.value = value
         self.on_change = on_change
         self.on_release = on_release
         self.panel_bg = panel_bg
+        self.disabled = disabled
         self._dragging = False
         self._items = []
 
         self._hit_id = canvas.create_rectangle(
             x, y, x + width, y + height, fill="", outline=""
         )
-        canvas.tag_bind(self._hit_id, "<Button-1>", self._on_press)
-        canvas.tag_bind(self._hit_id, "<B1-Motion>", self._on_drag)
-        canvas.tag_bind(self._hit_id, "<ButtonRelease-1>", self._on_release)
+        if not disabled:
+            canvas.tag_bind(self._hit_id, "<Button-1>", self._on_press)
+            canvas.tag_bind(self._hit_id, "<B1-Motion>", self._on_drag)
+            canvas.tag_bind(self._hit_id, "<ButtonRelease-1>", self._on_release)
 
         self.redraw()
 
@@ -452,7 +480,10 @@ class ModernSlider:
         ))
 
         fill_x = track_x1 + (track_x2 - track_x1) * (self.value / 100)
-        if fill_x > track_x1 + 1:
+        # 非対応モニターは操作できないことが一目でわかるよう、進捗の塗り
+        # つぶしもグロー演出も出さず、つまみもトラック上に固定した薄い
+        # 色のままにする(COLOR_ACCENTを一切使わない)。
+        if not self.disabled and fill_x > track_x1 + 1:
             self._items.append(_rounded_rect(
                 self.canvas, track_x1, track_y1, fill_x, track_y2, t,
                 fill=COLOR_ACCENT, outline=""
@@ -460,6 +491,15 @@ class ModernSlider:
 
         thumb_cx = fill_x
         thumb_cy = self.y + self.height / 2
+
+        if self.disabled:
+            r = self.THUMB_R
+            self._items.append(self.canvas.create_oval(
+                thumb_cx - r, thumb_cy - r, thumb_cx + r, thumb_cy + r,
+                fill=self.panel_bg, outline=COLOR_TEXT_FAINT, width=2
+            ))
+            self.canvas.tag_raise(self._hit_id)
+            return
 
         if self._dragging:
             # ドラッグ中だけ、つまみの周りにグロー(光暈)を薄く重ねて表示する。
@@ -533,6 +573,8 @@ class SliderPanel:
             return
 
         for m, slider, label in zip(self.snapshot, self.sliders, self.value_labels):
+            if m["brightness"] is None:
+                continue  # 非対応モニターはマスターフェーダーの対象外
             slider.set_value(value)
             if label is not None:
                 label.configure(text=f"{int(round(value))}%")
@@ -640,9 +682,8 @@ class SliderPanel:
                     fill=COLOR_ACCENT, font=("Segoe UI", 10, "bold")
                 )
 
-                master_value = round(
-                    sum((m["brightness"] or 0) for m in self.snapshot) / len(self.snapshot)
-                )
+                supported_brightness = [m["brightness"] for m in self.snapshot if m["brightness"] is not None]
+                master_value = round(sum(supported_brightness) / len(supported_brightness)) if supported_brightness else 0
                 master_label = None
                 label_w = 0
                 if show_number:
@@ -679,14 +720,27 @@ class SliderPanel:
                 row_y = cursor_y + i * row_h + 10
                 name = m["name"]
                 display_name = name if len(name) <= 24 else name[:22] + "..."
+                # brightnessがNone = get_monitor_snapshot()側でDDC/CI通信に
+                # 失敗した(=このモニターは輝度調整に非対応)ということなので、
+                # 名前を薄い色にし、スライダーも操作できない見た目にする。
+                unsupported = m["brightness"] is None
                 canvas.create_text(
                     self.PADDING, row_y, anchor="nw", text=display_name,
-                    fill=COLOR_TEXT_MAIN, font=FONT_BODY
+                    fill=COLOR_TEXT_FAINT if unsupported else COLOR_TEXT_MAIN, font=FONT_BODY
                 )
 
                 value_label = None
                 label_w = 0
-                if show_number:
+                if unsupported:
+                    label_w = 52
+                    value_label = tk.Label(
+                        win, text="非対応", font=FONT_BODY,
+                        fg=COLOR_TEXT_FAINT, bg=COLOR_PANEL_BG
+                    )
+                    canvas.create_window(
+                        width - self.PADDING, row_y + 17, anchor="ne", window=value_label
+                    )
+                elif show_number:
                     label_w = 34
                     value_label = tk.Label(
                         win, text=f"{m['brightness'] or 0}%", font=FONT_MONO,
@@ -697,7 +751,7 @@ class SliderPanel:
                     )
 
                 slider_y = row_y + 18
-                slider_width = width - self.PADDING * 2 - label_w - (6 if show_number else 0)
+                slider_width = width - self.PADDING * 2 - label_w - (6 if (show_number or unsupported) else 0)
 
                 def on_change(value, is_final, index=m["index"], label=value_label):
                     if label is not None:
@@ -711,7 +765,8 @@ class SliderPanel:
 
                 slider = ModernSlider(
                     canvas, self.PADDING, slider_y, slider_width, 14,
-                    value=m["brightness"] or 0, on_change=on_change, on_release=on_release
+                    value=m["brightness"] or 0, on_change=on_change, on_release=on_release,
+                    disabled=unsupported,
                 )
                 self.sliders.append(slider)
                 self.value_labels.append(value_label)

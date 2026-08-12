@@ -308,13 +308,12 @@ class _MONITORINFO(ctypes.Structure):
 
 
 def _active_monitor_work_area():
-    """マウスカーソルがあるモニターの作業領域(タスクバーを除く)を返す。
-    失敗した場合は例外を投げる(呼び出し側でフォールバックする)。"""
-    pt = _POINT()
-    if not ctypes.windll.user32.GetCursorPos(ctypes.byref(pt)):
-        raise OSError("GetCursorPos failed")
-    MONITOR_DEFAULTTONEAREST = 2
-    hmonitor = ctypes.windll.user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+    """メインモニター(プライマリディスプレイ)の作業領域(タスクバーを除く)
+    を返す。以前はマウスカーソルがあるモニターに追従していたが、常に
+    メインモニターに表示してほしいという要望で固定した。失敗した場合は
+    例外を投げる(呼び出し側でフォールバックする)。"""
+    MONITOR_DEFAULTTOPRIMARY = 1
+    hmonitor = ctypes.windll.user32.MonitorFromPoint(_POINT(0, 0), MONITOR_DEFAULTTOPRIMARY)
     if not hmonitor:
         raise OSError("MonitorFromPoint failed")
     info = _MONITORINFO()

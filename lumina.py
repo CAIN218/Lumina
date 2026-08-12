@@ -25,7 +25,7 @@ else:
 
 CONFIG_FILE = os.path.join(BASE_DIR, "app_config.txt")
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 GITHUB_REPO = "CAIN218/Lumina"
 
 # ----------------------------------------------------------------------
@@ -548,6 +548,8 @@ class SliderPanel:
         self._anim_start = 0
         self._final_x = 0
         self._final_y = 0
+        self._snapshot_queue = queue.Queue()
+        self._loading_token = 0
 
     def _apply_brightness(self, monitor_index, value, is_final):
         """個別モニターのスライダーの値を反映する。「一斉に動かせるように
@@ -591,45 +593,13 @@ class SliderPanel:
         else:
             self.open()
 
-    def open(self):
-        self.close()
-        settings = load_config()
-        show_number = settings.get("show_number", "1") == "1"
-        link_sliders = settings.get("link_sliders", "0") == "1"
-
-        self.snapshot = get_monitor_snapshot()
-        has_master = link_sliders and len(self.snapshot) > 1
-
-        row_h = self.ROW_HEIGHT
-        width = self.WIDTH
-        rows = max(1, len(self.snapshot))
-        body_h = rows * row_h if self.snapshot else 50
-        master_h = row_h + 6 if has_master else 0
-        height = self.HEADER_HEIGHT + master_h + body_h + self.PADDING
-
-        win = tk.Toplevel(self.root)
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
-        win.attributes("-alpha", 0.0)
-        win.configure(bg=COLOR_TRANSPARENT_KEY)
-        win.attributes("-transparentcolor", COLOR_TRANSPARENT_KEY)
-
-        canvas = tk.Canvas(win, width=width, height=height, bg=COLOR_TRANSPARENT_KEY,
-                            highlightthickness=0)
-        canvas.pack()
-
-        self.window = win
-        self.canvas = canvas
-        self.sliders = []
-        self.value_labels = []
-        self.master_slider = None
-        self.master_label = None
-
-        # 角丸パネル本体
+    def _draw_shell(self, canvas, width, height, loading):
+        """パネル本体(角丸背景・ヘッダー・閉じるボタン)を描く。中身
+        (スライダー行)は含まない。open()の最初(読み込み中の仮表示)と、
+        スナップショット取得後の本描画の両方から呼ぶため切り出している。"""
         _rounded_rect(canvas, 0, 0, width, height, self.CORNER_RADIUS,
                       fill=COLOR_PANEL_BG, outline=COLOR_PANEL_BORDER, width=1.2)
 
-        # ヘッダー(タイトル + 閉じるボタン)
         canvas.create_text(
             self.PADDING, self.HEADER_HEIGHT / 2, anchor="w", text="LUMINA",
             fill=COLOR_TEXT_SUB, font=("Segoe UI", 8, "bold")
@@ -661,6 +631,101 @@ class SliderPanel:
             self.PADDING * 0.4, self.HEADER_HEIGHT, width - self.PADDING * 0.4, self.HEADER_HEIGHT,
             fill=COLOR_PANEL_BORDER
         )
+        if loading:
+            canvas.create_text(
+                width / 2, self.HEADER_HEIGHT + 30,
+                text="読み込み中...", fill=COLOR_TEXT_SUB, font=FONT_BODY
+            )
+
+    def open(self):
+        self.close()
+        self._loading_token += 1
+        token = self._loading_token
+
+        # 応答が遅い/しないモニターがあると、get_monitor_snapshot()の
+        # DDC/CI通信が数秒かかることがある(EIZO機で実測3秒台)。メイン
+        # スレッドで同期的に待つとウィンドウ全体が固まり「開かない」ように
+        # 見えてしまうため、まずは軽い「読み込み中」表示だけを即座に出し、
+        # 実際の取得は別スレッドで行う。
+        width = self.WIDTH
+        height = self.HEADER_HEIGHT + 60
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", 0.0)
+        win.configure(bg=COLOR_TRANSPARENT_KEY)
+        win.attributes("-transparentcolor", COLOR_TRANSPARENT_KEY)
+
+        canvas = tk.Canvas(win, width=width, height=height, bg=COLOR_TRANSPARENT_KEY,
+                            highlightthickness=0)
+        canvas.pack()
+
+        self.window = win
+        self.canvas = canvas
+        self.sliders = []
+        self.value_labels = []
+        self.master_slider = None
+        self.master_label = None
+
+        self._draw_shell(canvas, width, height, loading=True)
+
+        win.update_idletasks()
+        left, top, right, bottom = _safe_work_area(win)
+        win_w = win.winfo_reqwidth()
+        win_h = win.winfo_reqheight()
+        self._final_x = max(left, right - win_w - 8)
+        self._final_y = max(top, bottom - win_h - 8)
+        win.geometry(f"{win_w}x{win_h}+{self._final_x}+{self._final_y + self.ANIM_SLIDE_PX}")
+
+        win.bind("<FocusOut>", lambda e: self.root.after(120, self._close_if_unfocused))
+        win.focus_force()
+
+        self._anim_start = time.time()
+        self._animate_open()
+
+        def worker():
+            snapshot = get_monitor_snapshot()
+            self._snapshot_queue.put((token, snapshot))
+        threading.Thread(target=worker, daemon=True).start()
+        self._poll_snapshot()
+
+    def _poll_snapshot(self):
+        try:
+            token, snapshot = self._snapshot_queue.get_nowait()
+        except queue.Empty:
+            if self.window is not None:
+                self.root.after(50, self._poll_snapshot)
+            return
+        if token != self._loading_token or self.window is None:
+            return  # 待っている間に閉じられた/開き直された結果は捨てる
+        self._render_content(snapshot)
+
+    def _render_content(self, snapshot):
+        settings = load_config()
+        show_number = settings.get("show_number", "1") == "1"
+        link_sliders = settings.get("link_sliders", "0") == "1"
+
+        self.snapshot = snapshot
+        has_master = link_sliders and len(self.snapshot) > 1
+
+        row_h = self.ROW_HEIGHT
+        width = self.WIDTH
+        rows = max(1, len(self.snapshot))
+        body_h = rows * row_h if self.snapshot else 50
+        master_h = row_h + 6 if has_master else 0
+        height = self.HEADER_HEIGHT + master_h + body_h + self.PADDING
+
+        win = self.window
+        canvas = self.canvas
+        canvas.delete("all")
+        canvas.configure(width=width, height=height)
+        self.sliders = []
+        self.value_labels = []
+        self.master_slider = None
+        self.master_label = None
+
+        self._draw_shell(canvas, width, height, loading=False)
 
         cursor_y = self.HEADER_HEIGHT
 
@@ -771,19 +836,16 @@ class SliderPanel:
                 self.sliders.append(slider)
                 self.value_labels.append(value_label)
 
+        # 読み込み中の仮表示から実際の内容に差し替えるだけなので、開く時の
+        # フェード/スライドアニメーションはやり直さず、サイズと位置(右下
+        # 基準)だけ更新する。ウィンドウはこの時点で既に表示済み。
         win.update_idletasks()
         left, top, right, bottom = _safe_work_area(win)
         win_w = win.winfo_reqwidth()
         win_h = win.winfo_reqheight()
         self._final_x = max(left, right - win_w - 8)
         self._final_y = max(top, bottom - win_h - 8)
-        win.geometry(f"{win_w}x{win_h}+{self._final_x}+{self._final_y + self.ANIM_SLIDE_PX}")
-
-        win.bind("<FocusOut>", lambda e: self.root.after(120, self._close_if_unfocused))
-        win.focus_force()
-
-        self._anim_start = time.time()
-        self._animate_open()
+        win.geometry(f"{win_w}x{win_h}+{self._final_x}+{self._final_y}")
 
     def _animate_open(self):
         if self.window is None:

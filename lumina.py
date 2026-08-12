@@ -149,9 +149,16 @@ def kill_previous_instances():
 # モニター制御
 # ----------------------------------------------------------------------
 
+_known_unsupported_monitors = set()  # プロセスの寿命の間だけ保持(再起動すれば再挑戦する)
+
+
 def get_monitor_snapshot():
     """接続中のモニター一覧と現在の輝度を取得する。
-    モニターによってはDDC/CI非対応で例外が出るため、1台ずつ個別にtryする。"""
+    モニターによってはDDC/CI非対応で例外が出るため、1台ずつ個別にtryする。
+    一部のモニター(EIZOのEcoView競合等)は失敗するまでに数秒かかることが
+    あり、毎回律儀に待つとパネルを開くたびに待たされてしまう。一度失敗
+    したモニターはシリアル/uidで覚えておき、以降はこのプロセスが動いて
+    いる間は読み取りを試さず即座に非対応扱いにする。"""
     snapshot = []
     try:
         infos = sbc.list_monitors_info()
@@ -161,11 +168,18 @@ def get_monitor_snapshot():
 
     for i, info in enumerate(infos):
         name = info.get("name") or info.get("model") or f"Monitor {i}"
+        key = info.get("serial") or info.get("uid") or name
+
+        if key in _known_unsupported_monitors:
+            snapshot.append({"index": i, "name": name, "brightness": None})
+            continue
+
         try:
             brightness = sbc.get_brightness(display=i)[0]
         except Exception as e:
             log_error(f"get_brightness[{i}]", e)
             brightness = None
+            _known_unsupported_monitors.add(key)
         snapshot.append({"index": i, "name": name, "brightness": brightness})
     return snapshot
 

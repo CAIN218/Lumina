@@ -659,8 +659,7 @@ class SliderPanel:
         # 応答が遅い/しないモニターがあると、get_monitor_snapshot()の
         # DDC/CI通信が数秒かかることがある(EIZO機で実測3秒台)。メイン
         # スレッドで同期的に待つとウィンドウ全体が固まり「開かない」ように
-        # 見えてしまうため、まずは軽い「読み込み中」表示だけを即座に出し、
-        # 実際の取得は別スレッドで行う。
+        # 見えてしまうため、実際の取得は必ず別スレッドで行う。
         width = self.WIDTH
         height = self.HEADER_HEIGHT + 60
 
@@ -682,15 +681,21 @@ class SliderPanel:
         self.master_slider = None
         self.master_label = None
 
-        self._draw_shell(canvas, width, height, loading=True)
-
-        win.update_idletasks()
-        left, top, right, bottom = _safe_work_area(win)
-        win_w = win.winfo_reqwidth()
-        win_h = win.winfo_reqheight()
-        self._final_x = max(left, right - win_w - 8)
-        self._final_y = max(top, bottom - win_h - 8)
-        win.geometry(f"{win_w}x{win_h}+{self._final_x}+{self._final_y + self.ANIM_SLIDE_PX}")
+        if self.snapshot:
+            # 前回取得済みのデータがあれば、開閉を連打しても毎回「読み込み
+            # 中」を経由しないよう、まずそれを使って即座に本描画する。
+            # 値が変わっている可能性はあるので、裏では必ず再取得もする
+            # (届き次第、表示中の内容を静かに更新する)。
+            self._render_content(self.snapshot, initial=True)
+        else:
+            self._draw_shell(canvas, width, height, loading=True)
+            win.update_idletasks()
+            left, top, right, bottom = _safe_work_area(win)
+            win_w = win.winfo_reqwidth()
+            win_h = win.winfo_reqheight()
+            self._final_x = max(left, right - win_w - 8)
+            self._final_y = max(top, bottom - win_h - 8)
+            win.geometry(f"{win_w}x{win_h}+{self._final_x}+{self._final_y + self.ANIM_SLIDE_PX}")
 
         win.bind("<FocusOut>", lambda e: self.root.after(120, self._close_if_unfocused))
         win.focus_force()
@@ -715,7 +720,7 @@ class SliderPanel:
             return  # 待っている間に閉じられた/開き直された結果は捨てる
         self._render_content(snapshot)
 
-    def _render_content(self, snapshot):
+    def _render_content(self, snapshot, initial=False):
         settings = load_config()
         show_number = settings.get("show_number", "1") == "1"
         link_sliders = settings.get("link_sliders", "0") == "1"
@@ -850,16 +855,22 @@ class SliderPanel:
                 self.sliders.append(slider)
                 self.value_labels.append(value_label)
 
-        # 読み込み中の仮表示から実際の内容に差し替えるだけなので、開く時の
-        # フェード/スライドアニメーションはやり直さず、サイズと位置(右下
-        # 基準)だけ更新する。ウィンドウはこの時点で既に表示済み。
         win.update_idletasks()
         left, top, right, bottom = _safe_work_area(win)
         win_w = win.winfo_reqwidth()
         win_h = win.winfo_reqheight()
         self._final_x = max(left, right - win_w - 8)
         self._final_y = max(top, bottom - win_h - 8)
-        win.geometry(f"{win_w}x{win_h}+{self._final_x}+{self._final_y}")
+        if initial:
+            # open()からの初回描画(キャッシュ済みデータで即座に本描画する
+            # ケース)。まだフェード/スライドアニメーションが始まっていない
+            # ので、_animate_open()が使うスライド分オフセットした位置に置く。
+            win.geometry(f"{win_w}x{win_h}+{self._final_x}+{self._final_y + self.ANIM_SLIDE_PX}")
+        else:
+            # 読み込み中の仮表示、または表示中の内容をバックグラウンドで
+            # 更新するケース。ウィンドウは既に表示済みなのでアニメーションは
+            # やり直さず、サイズと位置(右下基準)だけ更新する。
+            win.geometry(f"{win_w}x{win_h}+{self._final_x}+{self._final_y}")
 
     def _animate_open(self):
         if self.window is None:

@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tkinter as tk
+from tkinter import font as tkfont
 import time
 import sys
 import threading
@@ -8,8 +9,11 @@ import queue
 import ctypes
 import math
 import json
+import tempfile
+import zipfile
 import winreg
 import urllib.request
+import urllib.error
 import webbrowser
 import winshell
 from win32com.client import Dispatch
@@ -25,29 +29,65 @@ else:
 
 CONFIG_FILE = os.path.join(BASE_DIR, "app_config.txt")
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 GITHUB_REPO = "CAIN218/Lumina"
 
 # ----------------------------------------------------------------------
-# デザイントークン — 「Lumina(光)」らしい、深い紫紺の背景に暖色の
-# グロー(光暈)が浮かぶ配色。AudioSwitcherシリーズの渋いグラファイト×
-# カッパーとは意図的に differentiate し、単体ブランドとして今風に。
+# デザイントークン — Yuga's lab のアプリアイコン(暗い背景・白い線・差し色1色)
+# に合わせ、AudioSwitcherと同じ「暗い墨色×オフホワイト×差し色1色」の配色に
+# 揃える。Luminaの差し色はアイコンの太陽と同じアンバー。
 # ----------------------------------------------------------------------
-COLOR_PANEL_BG      = "#1b1531"
-COLOR_PANEL_BG_ALT  = "#231a3f"  # マスターフェーダー行のハイライト用
-COLOR_PANEL_BORDER  = "#4a3d78"
-COLOR_TRACK         = "#2c2450"
-COLOR_ACCENT        = "#ffb454"
-COLOR_ACCENT_HOVER  = "#ffcf8c"
-COLOR_ACCENT_SOFT   = "#7c6bb8"  # サブアクセント(マスターの目盛りなどに使用)
-COLOR_TEXT_MAIN     = "#f8f6ff"
-COLOR_TEXT_SUB      = "#a79fd6"
-COLOR_TEXT_FAINT    = "#655a99"
-COLOR_TRANSPARENT_KEY = "#0a090f"  # ウィンドウの角丸を出すための透過キー色
+COLOR_BG            = "#16151f"  # アイコンの背景色と同じ
+COLOR_PANEL_BG      = "#1d1c26"  # パネル本体
+COLOR_PANEL_BG_ALT  = "#25232f"  # マスターフェーダー行・ボタンのハイライト用
+COLOR_PANEL_BORDER  = "#34313d"
+COLOR_TRACK         = "#2e2c38"
+COLOR_ACCENT        = "#e0a85a"  # アンバー(アイコンの太陽と同じ)
+COLOR_ACCENT_HOVER  = "#ecbf80"
+COLOR_ACCENT_DIM    = "#5c4528"  # アクセントの控えめ版
+COLOR_TEXT_MAIN     = "#ece8e1"  # アイコンの白線に合わせたオフホワイト
+COLOR_TEXT_SUB      = "#a29c90"
+COLOR_TEXT_FAINT    = "#68645c"
+COLOR_TRANSPARENT_KEY = "#010203"  # ウィンドウの角丸を出すための透過キー色(UIでは使わない色)
 
-FONT_TITLE = ("Segoe UI Semibold", 9)
-FONT_BODY  = ("Segoe UI", 10)
-FONT_MONO  = ("Consolas", 9, "bold")
+# ----------------------------------------------------------------------
+# 表示言語 — 英語(既定)と日本語を右クリックメニューから切り替えられる。
+# 画面上の文言はすべて L("English", "日本語") の形で両方を並べて書き、
+# 表示する瞬間に選ぶ(パネルやメニューは開くたびに描き直すので即座に反映される)。
+# ----------------------------------------------------------------------
+LANG = "en"
+
+
+def L(en, ja):
+    """今の表示言語に合わせて、英語/日本語のどちらかを返す"""
+    return ja if LANG == "ja" else en
+
+
+# 画面には日本語と英数字が混ざる。Segoe UIには日本語の字形が無く、日本語部分
+# だけ別フォントに置き換わって太さや高さが揃わないため、AudioSwitcherと同じく
+# 両方を同じ字形で描ける「Yu Gothic UI」を優先し、無ければ順に代わりを使う。
+FONT_CANDIDATES = ("Yu Gothic UI", "Meiryo UI", "Segoe UI", "Noto Sans CJK JP")
+FONT_FAMILY = FONT_CANDIDATES[0]
+
+
+def F(size, weight="normal"):
+    """UI全体で使うフォント指定を返す(ファミリーはresolve_font_familyで決まる)"""
+    return (FONT_FAMILY, size, weight)
+
+
+def resolve_font_family(root):
+    """インストールされているフォントを見て、使うファミリーを決める。
+    Tkのルートが無いとフォント一覧を取れないので、ルート作成直後に呼ぶ。"""
+    global FONT_FAMILY
+    try:
+        installed = set(tkfont.families(root))
+    except Exception:
+        installed = set()
+    for name in FONT_CANDIDATES:
+        if name in installed:
+            FONT_FAMILY = name
+            break
+
 
 DEFAULT_SETTINGS = {
     "startup": "0",
@@ -55,6 +95,8 @@ DEFAULT_SETTINGS = {
     "show_number": "1",
     "delay_until_release": "0",  # 「止まるまで変更を遅らせる」。0=ドラッグ中も逐次反映、1=離した時だけ反映
     "link_sliders": "0",         # 「一斉に動かせるようにする」
+    "auto_update": "0",          # 「自動アップデート」。AudioSwitcherと同じく既定でOFF(通知だけ出す)
+    "language": "en",            # 表示言語。"en" / "ja"
 }
 
 
@@ -91,6 +133,60 @@ def _parse_version(tag):
 
 
 _update_queue = queue.Queue()
+_install_status_queue = queue.Queue()
+_notes_queue = queue.Queue()
+
+# 最後に見つかった新しいリリース。右クリックメニューの「vX.Y.Zに更新する」
+# 項目の表示/非表示と、「自動アップデート」をONにした瞬間の即時更新に使う。
+_update_state = {"info": None, "installing": False}
+
+UPDATE_NOTICE_FILE = os.path.join(BASE_DIR, "update_notice.json")
+_GITHUB_HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": "Lumina-update-check"}
+
+
+def _github_get(path):
+    req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}{path}", headers=_GITHUB_HEADERS)
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _fetch_latest_release_info():
+    """GitHubの最新リリースを確認する。__version__より新しい場合だけ
+    (latest_tag, release_url, package_url, notes)を返し、そうでなければ
+    Noneを返す。package_urlはポータブル版zip(Lumina-vX.Y.Z-win64.zip)の
+    ダウンロードURL、notesはリリースの説明文(Markdown)。呼び出し側で例外を
+    処理すること。"""
+    data = _github_get("/releases/latest")
+    latest_tag = data.get("tag_name", "")
+    release_url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
+    notes = data.get("body") or ""
+    package_url = None
+    for asset in data.get("assets", []) or []:
+        name = asset.get("name", "").lower()
+        if name.startswith("lumina") and name.endswith(".zip"):
+            package_url = asset.get("browser_download_url")
+            break
+    if latest_tag and _parse_version(latest_tag) > _parse_version(__version__):
+        return (latest_tag, release_url, package_url, notes)
+    return None
+
+
+def _fetch_release_notes_worker():
+    """右クリックメニューの「更新内容」用。今動いているバージョンのリリース
+    ノートを取りに行き、まだ公開されていない(開発中の)バージョンなら最新
+    リリースのものを代わりに出す。結果は_notes_queue経由でメインスレッドへ。"""
+    try:
+        try:
+            data = _github_get(f"/releases/tags/v{__version__}")
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                raise
+            data = _github_get("/releases/latest")
+        _notes_queue.put(("ok", data.get("tag_name") or f"v{__version__}", data.get("body") or ""))
+    except Exception as e:
+        log_error("fetch_release_notes", e)
+        _notes_queue.put(("error", f"v{__version__}", ""))
+
 
 def _update_check_loop():
     """1日1回、GitHubの最新リリースを確認する。バックグラウンドの常駐
@@ -99,19 +195,97 @@ def _update_check_loop():
     キューに積んでメインスレッド側(poll_ui_queue)に伝える。"""
     while True:
         try:
-            req = urllib.request.Request(
-                f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-                headers={"Accept": "application/vnd.github+json", "User-Agent": "Lumina-update-check"},
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            latest_tag = data.get("tag_name", "")
-            release_url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
-            if latest_tag and _parse_version(latest_tag) > _parse_version(__version__):
-                _update_queue.put((latest_tag, release_url))
+            info = _fetch_latest_release_info()
+            if info:
+                _update_queue.put(info)
         except Exception as e:
             log_error("update_check", e)
         time.sleep(24 * 60 * 60)
+
+
+def _write_update_notice(latest_tag, notes):
+    """再起動後の新バージョンが「更新内容」を一度だけ表示できるよう、更新前の
+    バージョンが自分で情報を書き残しておく。失敗しても更新自体は続ける。"""
+    try:
+        with open(UPDATE_NOTICE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"version": latest_tag, "notes": notes}, f, ensure_ascii=False)
+    except Exception as e:
+        log_error("write_update_notice", e)
+
+
+def _read_pending_update_notice():
+    """起動時に一度だけ呼ぶ。前回の更新時に書き残されたUPDATE_NOTICE_FILEが
+    あれば(version, notes)を返してすぐ削除する(次回からは出さない)。"""
+    if not os.path.exists(UPDATE_NOTICE_FILE):
+        return None
+    try:
+        with open(UPDATE_NOTICE_FILE, "r", encoding="utf-8") as f:
+            notice = json.load(f)
+    except Exception as e:
+        log_error("read_update_notice", e)
+        notice = None
+    try:
+        os.remove(UPDATE_NOTICE_FILE)
+    except Exception:
+        pass
+    if not notice:
+        return None
+    return notice.get("version", ""), notice.get("notes", "")
+
+
+def _download_and_apply_update(package_url, release_url, latest_tag="", notes=""):
+    """ポータブル版のzipをダウンロードし、中のLumina.exeを今のexeと入れ替えて
+    再起動する。Luminaはインストーラーを持たない(zipを展開して置くだけの)配布
+    形態なので、AudioSwitcherのようにインストーラーへ任せることができない。
+    実行中のexeは自分では上書きできないため、小さなバッチを別プロセスで起動し、
+    こちらが終了してロックが外れるのを待ってから差し替え・再起動させる。
+    結果は_install_status_queue経由でメインスレッドに伝える。"""
+    try:
+        if not getattr(sys, "frozen", False):
+            raise RuntimeError("self-update is only available in the packaged exe")
+        work_dir = tempfile.mkdtemp(prefix="lumina-update-")
+        zip_path = os.path.join(work_dir, "package.zip")
+        req = urllib.request.Request(package_url, headers={"User-Agent": "Lumina-update-check"})
+        with urllib.request.urlopen(req, timeout=60) as resp, open(zip_path, "wb") as f:
+            f.write(resp.read())
+
+        new_exe = os.path.join(work_dir, "Lumina.exe")
+        with zipfile.ZipFile(zip_path) as zf:
+            member = next((n for n in zf.namelist() if os.path.basename(n).lower() == "lumina.exe"), None)
+            if member is None:
+                raise RuntimeError("Lumina.exe not found in the update package")
+            with zf.open(member) as src, open(new_exe, "wb") as dst:
+                dst.write(src.read())
+
+        target = sys.executable
+        script = os.path.join(work_dir, "apply_update.cmd")
+        # copyが成功する(=旧プロセスが終わってexeのロックが外れる)まで最大60秒
+        # 待つ。それでも失敗した場合は差し替えずに元のexeをそのまま起動し直す。
+        with open(script, "w", encoding="mbcs") as f:
+            f.write(
+                "@echo off\r\n"
+                "set /a tries=0\r\n"
+                ":retry\r\n"
+                "ping -n 2 127.0.0.1 >nul\r\n"
+                f'copy /y "{new_exe}" "{target}" >nul 2>&1 && goto launch\r\n'
+                "set /a tries+=1\r\n"
+                "if %tries% lss 60 goto retry\r\n"
+                ":launch\r\n"
+                f'start "" "{target}"\r\n'
+            )
+        _write_update_notice(latest_tag, notes)
+        env = dict(os.environ)
+        # PyInstaller(onefile)のexeから別のonefile exeを起動する時は、展開先
+        # などの環境変数を引き継がないよう明示的にリセットさせる。
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        subprocess.Popen(
+            ["cmd", "/c", script], env=env, cwd=work_dir,
+            creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
+        _install_status_queue.put(("done", None))
+    except Exception as e:
+        log_error("apply_update", e)
+        _install_status_queue.put(("error", release_url))
 
 
 def enable_dpi_awareness():
@@ -364,52 +538,109 @@ def _ease_out_cubic(t):
 
 
 # ----------------------------------------------------------------------
-# トレイアイコンの生成(太陽のグリフ。小さいサイズでも潰れないよう
-# 装飾を絞ったフラットデザイン)
+# トレイアイコンの生成
+#
+# Yuga's labのLuminaアイコン(暗い背景に白線のモニター＋アンバーの太陽)を、
+# 通知領域の小さなサイズでも読めるよう線を太くしたグリフ。タスクバーの明暗に
+# 合わせて線の色を切り替える(暗いタスクバー→白線、明るいタスクバー→墨色の線)。
+# 白いタスクバーで白いアイコンが溶けて見えなくなる問題への対策。
 # ----------------------------------------------------------------------
+
+_PERSONALIZE_KEY = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+
 
 def _taskbar_is_light():
     """タスクバー(スタートメニュー含む)がWindowsのライトテーマかどうかを
-    レジストリから判定する。読み取りに失敗した場合はダーク扱いにして、
-    従来通りの明るいアイコンにフォールバックする。"""
+    レジストリから判定する。読み取りに失敗した場合はダーク扱いにする。"""
     try:
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-        )
-        value, _ = winreg.QueryValueEx(key, "SystemUsesLightTheme")
-        winreg.CloseKey(key)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _PERSONALIZE_KEY) as key:
+            value, _ = winreg.QueryValueEx(key, "SystemUsesLightTheme")
         return value == 1
     except Exception:
         return False
 
 
-def render_tray_icon():
-    """タスクバーがライトテーマだと真っ白なアイコンは背景に溶けて見えなく
-    なるため、タスクバーの明暗と逆側の色(ダーク→明るいアイコン、
-    ライト→暗いアイコン)で描き、常にコントラストを確保する。"""
-    size = 64
-    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    cx, cy = size / 2, size / 2
-    core_r = 15
-
-    if _taskbar_is_light():
-        icon_color = (27, 21, 49, 255)  # COLOR_PANEL_BGと同じ濃い紫紺
+def render_tray_icon(light_taskbar=None, size=64):
+    if light_taskbar is None:
+        light_taskbar = _taskbar_is_light()
+    if light_taskbar:
+        line = (22, 21, 31, 255)    # COLOR_BG(アイコンの背景色)と同じ墨色
+        sun = (196, 128, 40, 255)   # 明るい背景でも沈まないよう少し濃くしたアンバー
     else:
-        icon_color = (242, 236, 225, 255)  # 従来の暖色系オフホワイト
+        line = (236, 232, 225, 255)  # COLOR_TEXT_MAIN(アイコンの白線)
+        sun = (224, 168, 90, 255)    # COLOR_ACCENT
 
-    draw.ellipse([cx - core_r, cy - core_r, cx + core_r, cy + core_r], fill=icon_color)
+    ss = 4  # 縮小時にきれいなアンチエイリアスをかけるため、4倍で描いてから縮める
+    S = size * ss
+    k = S / 64
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    w = round(5.5 * k)
 
-    ray_inner, ray_outer, ray_width = core_r + 6, core_r + 15, 5
+    # モニター(外形・スタンド・台座)
+    draw.rounded_rectangle([3 * k, 7 * k, 61 * k, 47 * k], radius=7 * k, outline=line, width=w)
+    draw.line([32 * k, 47 * k, 32 * k, 55 * k], fill=line, width=w)
+    draw.rounded_rectangle([18 * k, 54 * k, 46 * k, 59.5 * k], radius=2.75 * k, fill=line)
+
+    # 画面の中の太陽
+    cx, cy, r = 32 * k, 27 * k, 7.5 * k
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=sun)
+    ray_w = round(3.6 * k)
     for i in range(8):
         angle = math.radians(i * 45)
-        x1 = cx + ray_inner * math.cos(angle)
-        y1 = cy + ray_inner * math.sin(angle)
-        x2 = cx + ray_outer * math.cos(angle)
-        y2 = cy + ray_outer * math.sin(angle)
-        draw.line([x1, y1, x2, y2], fill=icon_color, width=ray_width)
-    return img
+        x1, y1 = cx + 11.5 * k * math.cos(angle), cy + 11.5 * k * math.sin(angle)
+        x2, y2 = cx + 14.5 * k * math.cos(angle), cy + 14.5 * k * math.sin(angle)
+        draw.line([x1, y1, x2, y2], fill=sun, width=ray_w)
+        for x, y in ((x1, y1), (x2, y2)):  # 線の端を丸くする
+            draw.ellipse([x - ray_w / 2, y - ray_w / 2, x + ray_w / 2, y + ray_w / 2], fill=sun)
+    return img.resize((size, size), Image.LANCZOS)
+
+
+def _watch_taskbar_theme(on_change):
+    """Windowsの「色」設定(ライト/ダーク)が切り替わったら、on_change(is_light)
+    を呼ぶ。RegNotifyChangeKeyValueでレジストリの変更通知を待つので、ポーリング
+    と違って何も起きていない間はCPUを使わない。通知APIが使えない場合だけ
+    5秒おきの読み直しにフォールバックする。"""
+    REG_NOTIFY_CHANGE_LAST_SET = 0x00000004
+    last = _taskbar_is_light()
+    while True:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _PERSONALIZE_KEY, 0,
+                                winreg.KEY_NOTIFY | winreg.KEY_READ) as key:
+                rc = ctypes.windll.advapi32.RegNotifyChangeKeyValue(
+                    ctypes.c_void_p(int(key)), False, REG_NOTIFY_CHANGE_LAST_SET, None, False)
+            if rc != 0:
+                raise OSError(f"RegNotifyChangeKeyValue failed: {rc}")
+        except Exception as e:
+            log_error("watch_taskbar_theme", e)
+            time.sleep(5)
+        current = _taskbar_is_light()
+        if current != last:
+            last = current
+            try:
+                on_change(current)
+            except Exception as e:
+                log_error("taskbar_theme_changed", e)
+
+
+def draw_lumina_glyph(canvas, cx, cy, size, line=COLOR_TEXT_MAIN, sun=COLOR_ACCENT):
+    """トレイアイコンと同じモニター＋太陽のグリフをCanvasに描く(パネルの
+    ヘッダーやトースト用)。sizeはグリフ全体の幅。"""
+    k = size / 64
+    x0, y0 = cx - size / 2, cy - size / 2
+    w = max(1.5, 5 * k)
+    _rounded_rect(canvas, x0 + 3 * k, y0 + 7 * k, x0 + 61 * k, y0 + 47 * k, 6 * k,
+                  fill="", outline=line, width=w)
+    canvas.create_line(x0 + 32 * k, y0 + 47 * k, x0 + 32 * k, y0 + 55 * k, fill=line, width=w)
+    canvas.create_line(x0 + 20 * k, y0 + 57 * k, x0 + 44 * k, y0 + 57 * k, fill=line, width=w,
+                       capstyle="round")
+    scx, scy, r = x0 + 32 * k, y0 + 27 * k, 7.5 * k
+    canvas.create_oval(scx - r, scy - r, scx + r, scy + r, fill=sun, outline="")
+    for i in range(8):
+        a = math.radians(i * 45)
+        canvas.create_line(scx + 11.5 * k * math.cos(a), scy + 11.5 * k * math.sin(a),
+                           scx + 15 * k * math.cos(a), scy + 15 * k * math.sin(a),
+                           fill=sun, width=max(1.2, 3.4 * k), capstyle="round")
 
 
 # ----------------------------------------------------------------------
@@ -540,8 +771,8 @@ class ModernSlider:
 # ----------------------------------------------------------------------
 
 class SliderPanel:
-    ROW_HEIGHT = 44
-    HEADER_HEIGHT = 34
+    ROW_HEIGHT = 52
+    HEADER_HEIGHT = 44
     PADDING = 18
     WIDTH = 320
     CORNER_RADIUS = 16
@@ -613,9 +844,15 @@ class SliderPanel:
         _rounded_rect(canvas, 0, 0, width, height, self.CORNER_RADIUS,
                       fill=COLOR_PANEL_BG, outline=COLOR_PANEL_BORDER, width=1.2)
 
+        draw_lumina_glyph(canvas, self.PADDING + 9, self.HEADER_HEIGHT / 2, 20)
+        title = canvas.create_text(
+            self.PADDING + 26, self.HEADER_HEIGHT / 2, anchor="w", text="Lumina",
+            fill=COLOR_TEXT_MAIN, font=F(10, "bold")
+        )
+        bbox = canvas.bbox(title)
         canvas.create_text(
-            self.PADDING, self.HEADER_HEIGHT / 2, anchor="w", text="LUMINA",
-            fill=COLOR_TEXT_SUB, font=("Segoe UI", 8, "bold")
+            (bbox[2] if bbox else self.PADDING + 80) + 6, self.HEADER_HEIGHT / 2 + 1, anchor="w",
+            text=f"v{__version__}", fill=COLOR_TEXT_FAINT, font=F(8)
         )
         close_cx, close_cy, close_r = width - self.PADDING, self.HEADER_HEIGHT / 2, 9
         close_hit = canvas.create_oval(
@@ -641,13 +878,13 @@ class SliderPanel:
             canvas.itemconfig(close_line2, fill=COLOR_TEXT_SUB),
         ))
         canvas.create_line(
-            self.PADDING * 0.4, self.HEADER_HEIGHT, width - self.PADDING * 0.4, self.HEADER_HEIGHT,
+            self.PADDING, self.HEADER_HEIGHT, width - self.PADDING, self.HEADER_HEIGHT,
             fill=COLOR_PANEL_BORDER
         )
         if loading:
             canvas.create_text(
                 width / 2, self.HEADER_HEIGHT + 30,
-                text="読み込み中...", fill=COLOR_TEXT_SUB, font=FONT_BODY
+                text=L("Loading...", "読み込み中..."), fill=COLOR_TEXT_SUB, font=F(10)
             )
 
     def open(self):
@@ -731,7 +968,7 @@ class SliderPanel:
         width = self.WIDTH
         rows = max(1, len(self.snapshot))
         body_h = rows * row_h if self.snapshot else 50
-        master_h = row_h + 6 if has_master else 0
+        master_h = row_h + 8 if has_master else 0
         height = self.HEADER_HEIGHT + master_h + body_h + self.PADDING
 
         win = self.window
@@ -750,8 +987,8 @@ class SliderPanel:
         if not self.snapshot:
             canvas.create_text(
                 width / 2, self.HEADER_HEIGHT + body_h / 2,
-                text="DDC/CI対応モニターが\n見つかりません",
-                fill=COLOR_TEXT_SUB, font=FONT_BODY, justify="center"
+                text=L("No DDC/CI-capable\nmonitors found", "DDC/CI対応モニターが\n見つかりません"),
+                fill=COLOR_TEXT_SUB, font=F(10), justify="center"
             )
         else:
             if has_master:
@@ -761,25 +998,23 @@ class SliderPanel:
                     cursor_y + master_h - 4, 10, fill=COLOR_PANEL_BG_ALT, outline=""
                 )
                 canvas.create_text(
-                    self.PADDING, master_row_y, anchor="nw", text="すべてのモニター",
-                    fill=COLOR_ACCENT, font=("Segoe UI", 10, "bold")
+                    self.PADDING, master_row_y, anchor="nw", text=L("All Monitors", "すべてのモニター"),
+                    fill=COLOR_ACCENT, font=F(9, "bold")
                 )
 
                 supported_brightness = [m["brightness"] for m in self.snapshot if m["brightness"] is not None]
                 master_value = round(sum(supported_brightness) / len(supported_brightness)) if supported_brightness else 0
                 master_label = None
-                label_w = 0
                 if show_number:
-                    label_w = 34
                     master_label = tk.Label(
-                        win, text=f"{master_value}%", font=FONT_MONO,
+                        win, text=f"{master_value}%", font=F(10, "bold"), pady=0,
                         fg=COLOR_ACCENT, bg=COLOR_PANEL_BG_ALT
                     )
                     canvas.create_window(
-                        width - self.PADDING, master_row_y + 17, anchor="ne", window=master_label
+                        width - self.PADDING, master_row_y - 2, anchor="ne", window=master_label
                     )
 
-                slider_width = width - self.PADDING * 2 - label_w - (6 if show_number else 0)
+                slider_width = width - self.PADDING * 2
 
                 def on_master_change(value, is_final):
                     if master_label is not None:
@@ -792,7 +1027,7 @@ class SliderPanel:
                     self._apply_master(value, True)
 
                 self.master_slider = ModernSlider(
-                    canvas, self.PADDING, master_row_y + 18, slider_width, 14,
+                    canvas, self.PADDING, master_row_y + 24, slider_width, 14,
                     value=master_value, on_change=on_master_change, on_release=on_master_release,
                     panel_bg=COLOR_PANEL_BG_ALT,
                 )
@@ -809,32 +1044,29 @@ class SliderPanel:
                 unsupported = m["brightness"] is None
                 canvas.create_text(
                     self.PADDING, row_y, anchor="nw", text=display_name,
-                    fill=COLOR_TEXT_FAINT if unsupported else COLOR_TEXT_MAIN, font=FONT_BODY
+                    fill=COLOR_TEXT_FAINT if unsupported else COLOR_TEXT_MAIN, font=F(10)
                 )
 
                 value_label = None
-                label_w = 0
                 if unsupported:
-                    label_w = 52
                     value_label = tk.Label(
-                        win, text="非対応", font=FONT_BODY,
+                        win, text=L("Unsupported", "非対応"), font=F(9), pady=0,
                         fg=COLOR_TEXT_FAINT, bg=COLOR_PANEL_BG
                     )
                     canvas.create_window(
-                        width - self.PADDING, row_y + 17, anchor="ne", window=value_label
+                        width - self.PADDING, row_y - 2, anchor="ne", window=value_label
                     )
                 elif show_number:
-                    label_w = 34
                     value_label = tk.Label(
-                        win, text=f"{m['brightness'] or 0}%", font=FONT_MONO,
+                        win, text=f"{m['brightness'] or 0}%", font=F(10, "bold"), pady=0,
                         fg=COLOR_ACCENT, bg=COLOR_PANEL_BG
                     )
                     canvas.create_window(
-                        width - self.PADDING, row_y + 17, anchor="ne", window=value_label
+                        width - self.PADDING, row_y - 2, anchor="ne", window=value_label
                     )
 
-                slider_y = row_y + 18
-                slider_width = width - self.PADDING * 2 - label_w - (6 if (show_number or unsupported) else 0)
+                slider_y = row_y + 24
+                slider_width = width - self.PADDING * 2
 
                 def on_change(value, is_final, index=m["index"], label=value_label):
                     if label is not None:
@@ -924,7 +1156,9 @@ class SliderPanel:
 # ----------------------------------------------------------------------
 
 class ToastManager:
-    WIDTH, HEIGHT = 260, 60
+    WIDTH, HEIGHT = 300, 68
+    WHATSNEW_WIDTH = 360
+    TEXT_X = 62
 
     def __init__(self, root):
         self.root = root
@@ -932,8 +1166,16 @@ class ToastManager:
         self.canvas = None
         self.fade_job = None
         self.current_alpha = 0.0
+        self._slide = 0
         self.on_click = None
         self._hold_ms = 1600
+        self._subtitle_id = None
+        self._pending_release_url = None
+        self.whatsnew_window = None
+        self.whatsnew_canvas = None
+        self.whatsnew_alpha = 0.0
+        self.whatsnew_fade_job = None
+        self.whatsnew_height = 200
 
     def _ensure_window(self):
         if self.window is not None:
@@ -959,78 +1201,278 @@ class ToastManager:
     def _place(self):
         left, top, right, bottom = _safe_work_area(self.window)
         x = right - self.WIDTH - 8
-        y = bottom - self.HEIGHT - 8
+        y = bottom - self.HEIGHT - 8 + round(self._slide)
         self.window.geometry(f"{self.WIDTH}x{self.HEIGHT}+{x}+{y}")
+
+    def _draw_frame(self, header_text):
+        """全トースト共通の土台(角丸パネル・左のアイコンバッジ・見出し)"""
+        canvas = self.canvas
+        canvas.delete("all")
+        _rounded_rect(canvas, 1, 1, self.WIDTH - 1, self.HEIGHT - 1, 14,
+                      fill=COLOR_PANEL_BG, outline=COLOR_PANEL_BORDER, width=1)
+        cy = self.HEIGHT / 2
+        _rounded_rect(canvas, 14, cy - 18, 50, cy + 18, 10, fill=COLOR_PANEL_BG_ALT, outline="")
+        draw_lumina_glyph(canvas, 32, cy, 24)
+        canvas.create_text(self.TEXT_X, cy - 11, anchor="w", text=header_text,
+                           fill=COLOR_TEXT_SUB, font=F(8, "bold"))
+
+    def _start(self, hold_ms):
+        if self.fade_job:
+            self.root.after_cancel(self.fade_job)
+            self.fade_job = None
+        self._hold_ms = hold_ms
+        self.current_alpha = 0.0
+        self._slide = 12
+        self._place()
+        self.window.deiconify()
+        self._place()
+        self._fade_in()
 
     def show(self, brightness_percent):
         self._ensure_window()
-        if self.fade_job:
-            self.root.after_cancel(self.fade_job)
-            self.fade_job = None
-
+        self._draw_frame(L("Brightness", "明るさ"))
         canvas = self.canvas
-        canvas.delete("all")
-        _rounded_rect(canvas, 1, 1, self.WIDTH - 1, self.HEIGHT - 1, 14,
-                      fill=COLOR_PANEL_BG, outline=COLOR_PANEL_BORDER, width=1)
-        canvas.create_rectangle(0, 10, 4, self.HEIGHT - 10, fill=COLOR_ACCENT, outline="")
-        canvas.create_text(20, 18, anchor="w", text="LUMINA",
-                            fill=COLOR_ACCENT, font=("Segoe UI", 8, "bold"))
-        canvas.create_text(20, 38, anchor="w", text=f"{int(round(brightness_percent))}%",
-                            fill=COLOR_TEXT_MAIN, font=("Segoe UI", 13, "bold"))
+        cy = self.HEIGHT / 2
+        value = int(round(brightness_percent))
+        canvas.create_text(self.TEXT_X, cy + 9, anchor="w", text=f"{value}%",
+                           fill=COLOR_TEXT_MAIN, font=F(13, "bold"))
+        # 現在値をミニバーでも示す
+        bar_x1, bar_x2, bar_y = self.TEXT_X + 70, self.WIDTH - 22, cy + 10
+        _rounded_rect(canvas, bar_x1, bar_y - 2, bar_x2, bar_y + 2, 2, fill=COLOR_TRACK, outline="")
+        fill_x = bar_x1 + (bar_x2 - bar_x1) * max(0, min(100, value)) / 100
+        if fill_x > bar_x1 + 2:
+            _rounded_rect(canvas, bar_x1, bar_y - 2, fill_x, bar_y + 2, 2, fill=COLOR_ACCENT, outline="")
         canvas.configure(cursor="")
-
         self.on_click = None
-        self._hold_ms = 1600
-        self._place()
-        self.window.deiconify()
-        self._place()
-        self.current_alpha = 0.0
-        self._fade_in()
+        self._start(1600)
 
-    def show_update_available(self, latest_tag, release_url):
-        """新しいバージョンが見つかった時の控えめな通知。クリックでリリース
-        ページを開く。頻繁に出るものではないので、通常のトーストより長めに
-        表示したままにする。"""
+    def show_update_available(self, latest_tag, release_url, package_url=None, notes="", auto=False):
+        """新しいバージョンが見つかった時の控えめな通知。exe版でzipがあれば
+        クリック(自動アップデートONなら即座に)でダウンロードして入れ替える。
+        それ以外(ソースから実行中・zipの無いリリース)はリリースページを開く。"""
         self._ensure_window()
+        self._draw_frame(L("Update available", "アップデートがあります"))
+        canvas = self.canvas
+        can_install = bool(package_url) and getattr(sys, "frozen", False)
+        auto = auto and can_install
+        if auto:
+            subtitle = L(f"{latest_tag} — updating automatically...", f"{latest_tag} — 自動で更新しています...")
+        elif can_install:
+            subtitle = L(f"{latest_tag} — click to update", f"{latest_tag} — クリックで更新")
+        else:
+            subtitle = L(f"{latest_tag} — click to view", f"{latest_tag} — クリックで詳細を表示")
+        self._subtitle_id = canvas.create_text(self.TEXT_X, self.HEIGHT / 2 + 9, anchor="w", text=subtitle,
+                                               fill=COLOR_TEXT_MAIN, font=F(10, "bold"))
+        self._pending_release_url = release_url
+        if auto:
+            canvas.configure(cursor="")
+            self.on_click = None
+        elif can_install:
+            canvas.configure(cursor="hand2")
+            self.on_click = lambda: self.begin_update(latest_tag, release_url, package_url, notes)
+        else:
+            canvas.configure(cursor="hand2")
+            self.on_click = lambda: webbrowser.open(release_url)
+        self._start(8000)
+        if auto:
+            self.begin_update(latest_tag, release_url, package_url, notes)
+
+    def begin_update(self, latest_tag, release_url, package_url, notes=""):
+        """更新を開始する。Tkのメインスレッドを止めないよう、ダウンロードと
+        展開は別スレッドで行い、結果は_install_status_queue経由で受け取る。"""
+        if _update_state["installing"]:
+            return
+        _update_state["installing"] = True
+        if self.window is None or not self.window.winfo_viewable():
+            self.show_update_available(latest_tag, release_url, package_url, notes)
         if self.fade_job:
             self.root.after_cancel(self.fade_job)
             self.fade_job = None
+        self.on_click = None
+        try:
+            self.canvas.configure(cursor="")
+            if self._subtitle_id is not None:
+                self.canvas.itemconfigure(self._subtitle_id, text=L("Downloading...", "ダウンロードしています..."))
+        except Exception:
+            pass
+        threading.Thread(target=_download_and_apply_update,
+                         args=(package_url, release_url, latest_tag, notes), daemon=True).start()
 
-        canvas = self.canvas
-        canvas.delete("all")
-        _rounded_rect(canvas, 1, 1, self.WIDTH - 1, self.HEIGHT - 1, 14,
-                      fill=COLOR_PANEL_BG, outline=COLOR_PANEL_BORDER, width=1)
-        canvas.create_rectangle(0, 10, 4, self.HEIGHT - 10, fill=COLOR_ACCENT, outline="")
-        canvas.create_text(20, 18, anchor="w", text="UPDATE AVAILABLE",
-                            fill=COLOR_ACCENT, font=("Segoe UI", 8, "bold"))
-        canvas.create_text(20, 38, anchor="w", text=f"{latest_tag} — click to view",
-                            fill=COLOR_TEXT_MAIN, font=("Segoe UI", 10, "bold"))
-        canvas.configure(cursor="hand2")
-
-        self.on_click = lambda: webbrowser.open(release_url)
-        self._hold_ms = 8000
-        self._place()
-        self.window.deiconify()
-        self._place()
-        self.current_alpha = 0.0
-        self._fade_in()
+    def finish_update(self, ok):
+        """ダウンロード完了(成功/失敗)を受けて表示を更新する。失敗時は
+        クリックでリリースページを開けるようにフォールバックする。"""
+        if not ok:
+            _update_state["installing"] = False
+        try:
+            if self._subtitle_id is not None and self.canvas is not None:
+                if ok:
+                    self.canvas.itemconfigure(self._subtitle_id, text=L("Updating — Lumina will restart automatically", "更新しています — 自動で再起動します"))
+                else:
+                    self.canvas.itemconfigure(self._subtitle_id, text=L("Update failed — click to view", "更新に失敗 — クリックで詳細を表示"))
+                    self.canvas.configure(cursor="hand2")
+                    url = self._pending_release_url
+                    self.on_click = lambda: webbrowser.open(url)
+        except Exception:
+            pass
+        if self.fade_job:
+            self.root.after_cancel(self.fade_job)
+        self.fade_job = self.root.after(5000, self._fade_out)
 
     def _fade_in(self):
-        if self.current_alpha < 0.96:
-            self.current_alpha += 0.14
-            self.window.attributes("-alpha", min(self.current_alpha, 0.96))
+        # フェードしながら下から少しせり上がる
+        if self.current_alpha < 0.97:
+            self.current_alpha += 0.12
+            self._slide = max(0.0, self._slide * 0.7)
+            self.window.attributes("-alpha", min(self.current_alpha, 0.97))
+            self._place()
             self.fade_job = self.root.after(15, self._fade_in)
         else:
+            self._slide = 0
+            self._place()
             self.fade_job = self.root.after(self._hold_ms, self._fade_out)
 
     def _fade_out(self):
         if self.current_alpha > 0.0:
-            self.current_alpha -= 0.07
+            self.current_alpha -= 0.08
             self.window.attributes("-alpha", max(self.current_alpha, 0.0))
             self.fade_job = self.root.after(15, self._fade_out)
         else:
             self.window.withdraw()
             self.fade_job = None
+
+    # ------------------------------------------------------------------
+    # 更新内容(リリースノート)のポップアップ。アップデート直後に一度だけ
+    # 自動で出るほか、右クリックメニューの「更新内容」からいつでも開ける。
+    # 読む時間が必要なので自動では消さず、クリックで閉じる。
+    # ------------------------------------------------------------------
+
+    def _ensure_whatsnew_window(self):
+        if self.whatsnew_window is not None:
+            return
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.attributes("-alpha", 0.0)
+        win.configure(bg=COLOR_TRANSPARENT_KEY)
+        win.attributes("-transparentcolor", COLOR_TRANSPARENT_KEY)
+
+        canvas = tk.Canvas(win, width=self.WHATSNEW_WIDTH, height=self.whatsnew_height,
+                            bg=COLOR_TRANSPARENT_KEY, highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        canvas.bind("<Button-1>", lambda e: self._dismiss_whats_new())
+        win.withdraw()
+
+        self.whatsnew_window = win
+        self.whatsnew_canvas = canvas
+
+    def _place_whats_new(self):
+        left, top, right, bottom = _safe_work_area(self.whatsnew_window)
+        x = right - self.WHATSNEW_WIDTH - 8
+        y = bottom - self.whatsnew_height - 8
+        self.whatsnew_window.geometry(f"{self.WHATSNEW_WIDTH}x{self.whatsnew_height}+{x}+{y}")
+
+    def show_whats_new(self, version, notes, header=None, footer_url=None):
+        if header is None:
+            header = L("Updated", "アップデートしました")
+        self._ensure_whatsnew_window()
+        if self.whatsnew_fade_job:
+            self.root.after_cancel(self.whatsnew_fade_job)
+            self.whatsnew_fade_job = None
+
+        canvas = self.whatsnew_canvas
+        canvas.delete("all")
+        W = self.WHATSNEW_WIDTH
+        MAX_H = 440
+        FOOTER_H = 48
+
+        _rounded_rect(canvas, 18, 16, 54, 52, 10, fill=COLOR_PANEL_BG_ALT, outline="")
+        draw_lumina_glyph(canvas, 36, 34, 24)
+        canvas.create_text(66, 25, anchor="w", text=header, fill=COLOR_ACCENT, font=F(9, "bold"))
+        canvas.create_text(66, 44, anchor="w", text=f"Lumina {version}",
+                           fill=COLOR_TEXT_MAIN, font=F(13, "bold"))
+        canvas.create_line(18, 66, W - 18, 66, fill=COLOR_PANEL_BORDER)
+
+        # Markdownの見出し(#)と箇条書き(-)だけを簡単に見た目調整して並べる
+        y = 78
+        body = (notes or "").strip() or L("No release notes.", "リリースノートはありません。")
+        for raw in body.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            dot = None
+            if line.startswith("#"):
+                item = canvas.create_text(22, y + 6, anchor="nw", text=line.lstrip("#").strip(),
+                                          fill=COLOR_ACCENT, font=F(9, "bold"))
+            elif line.startswith(("- ", "* ")):
+                dot = canvas.create_oval(24, y + 7, 29, y + 12, fill=COLOR_TEXT_SUB, outline="")
+                item = canvas.create_text(38, y, anchor="nw", text=line[2:].replace("`", ""),
+                                          fill=COLOR_TEXT_MAIN, font=F(9), width=W - 58)
+            else:
+                item = canvas.create_text(22, y, anchor="nw", text=line.replace("`", ""),
+                                          fill=COLOR_TEXT_SUB, font=F(9), width=W - 44)
+            bbox = canvas.bbox(item)
+            bottom = bbox[3] if bbox else y + 16
+            if bottom > MAX_H - FOOTER_H:
+                # 入りきらない分は省略して、続きがあることだけ伝える
+                canvas.delete(item)
+                if dot is not None:
+                    canvas.delete(dot)
+                canvas.create_text(22, y, anchor="nw", text=L("…more in the release notes on GitHub", "…続きは GitHub のリリースノートへ"),
+                                   fill=COLOR_TEXT_FAINT, font=F(9))
+                y += 20
+                break
+            y = bottom + 5
+        H = min(MAX_H, y + FOOTER_H)
+
+        footer_y = H - 26
+        btn = _rounded_rect(canvas, W - 98, footer_y - 14, W - 18, footer_y + 14, 8,
+                            fill=COLOR_PANEL_BG_ALT, outline="")
+        btn_text = canvas.create_text(W - 58, footer_y, text=L("Close", "閉じる"), fill=COLOR_TEXT_MAIN, font=F(9, "bold"))
+        for item in (btn, btn_text):
+            canvas.tag_bind(item, "<Enter>", lambda e: canvas.itemconfig(btn, fill=COLOR_PANEL_BORDER))
+            canvas.tag_bind(item, "<Leave>", lambda e: canvas.itemconfig(btn, fill=COLOR_PANEL_BG_ALT))
+        url = footer_url or f"https://github.com/{GITHUB_REPO}/releases"
+        link = canvas.create_text(22, footer_y, anchor="w", text=L("View on GitHub", "GitHubで見る"),
+                                  fill=COLOR_TEXT_SUB, font=F(9))
+        canvas.tag_bind(link, "<Enter>", lambda e: canvas.itemconfig(link, fill=COLOR_ACCENT))
+        canvas.tag_bind(link, "<Leave>", lambda e: canvas.itemconfig(link, fill=COLOR_TEXT_SUB))
+        # リンクのクリックはウィンドウ全体の「クリックで閉じる」より先に処理し、
+        # ブラウザを開いた上でポップアップも閉じる
+        canvas.tag_bind(link, "<Button-1>", lambda e: webbrowser.open(url))
+        panel = _rounded_rect(canvas, 1, 1, W - 1, H - 1, 16,
+                              fill=COLOR_PANEL_BG, outline=COLOR_PANEL_BORDER, width=1)
+        canvas.tag_lower(panel)
+        canvas.configure(cursor="hand2", height=H)
+        self.whatsnew_height = H
+
+        self._place_whats_new()
+        self.whatsnew_window.deiconify()
+        self._place_whats_new()
+        self.whatsnew_alpha = 0.0
+        self._whatsnew_fade_in()
+
+    def _dismiss_whats_new(self):
+        if self.whatsnew_fade_job:
+            self.root.after_cancel(self.whatsnew_fade_job)
+            self.whatsnew_fade_job = None
+        self._whatsnew_fade_out()
+
+    def _whatsnew_fade_in(self):
+        if self.whatsnew_alpha < 0.97:
+            self.whatsnew_alpha += 0.12
+            self.whatsnew_window.attributes("-alpha", min(self.whatsnew_alpha, 0.97))
+            self.whatsnew_fade_job = self.root.after(15, self._whatsnew_fade_in)
+        else:
+            self.whatsnew_fade_job = None
+
+    def _whatsnew_fade_out(self):
+        if self.whatsnew_alpha > 0.0:
+            self.whatsnew_alpha -= 0.08
+            self.whatsnew_window.attributes("-alpha", max(self.whatsnew_alpha, 0.0))
+            self.whatsnew_fade_job = self.root.after(15, self._whatsnew_fade_out)
+        else:
+            self.whatsnew_window.withdraw()
+            self.whatsnew_fade_job = None
 
 
 # ----------------------------------------------------------------------
@@ -1056,10 +1498,24 @@ def _build_menu():
             save_config(current)
             if key == "startup":
                 manage_startup(current[key] == "1")
+            elif key == "auto_update" and current[key] == "1":
+                # ONにした時点で既に新しいバージョンが見つかっていれば、次の
+                # 定期チェック(最大1日後)を待たずにすぐ更新する
+                _ui_action_queue.put(("install_update", None))
         return _handler
 
     def on_open_panel(icon, item):
         _ui_action_queue.put(("open_panel", None))
+
+    def on_show_notes(icon, item):
+        _ui_action_queue.put(("show_notes", None))
+
+    def on_install_update(icon, item):
+        _ui_action_queue.put(("install_update", None))
+
+    def update_label(item):
+        info = _update_state["info"]
+        return L(f"Update to {info[0]}", f"{info[0]} に更新する") if info else ""
 
     def on_open_taskbar_settings(icon, item):
         # アプリ自身がタスクバーへの「常時表示」を強制するAPIはWindowsには
@@ -1073,37 +1529,72 @@ def _build_menu():
     def on_quit(icon, item):
         _ui_action_queue.put(("quit", None))
 
+    def set_language(lang):
+        def _handler(icon, item):
+            global LANG
+            current = load_config()
+            current["language"] = lang
+            save_config(current)
+            LANG = lang
+            _ui_action_queue.put(("language_changed", None))
+        return _handler
+
     return pystray.Menu(
         pystray.MenuItem("open", on_open_panel, default=True, visible=False),
-        pystray.MenuItem("サインイン時に起動する", toggle("startup"), checked=lambda i: is_on("startup")),
-        pystray.MenuItem("調整後の明るさを表示する", toggle("show_toast_after"), checked=lambda i: is_on("show_toast_after")),
-        pystray.MenuItem("現在の数字を表示する", toggle("show_number"), checked=lambda i: is_on("show_number")),
-        pystray.MenuItem("止まるまで変更を遅らせる", toggle("delay_until_release"), checked=lambda i: is_on("delay_until_release")),
-        pystray.MenuItem("一斉に動かせるようにする", toggle("link_sliders"), checked=lambda i: is_on("link_sliders")),
+        pystray.MenuItem(f"Lumina  v{__version__}", None, enabled=False),
+        pystray.MenuItem(update_label, on_install_update, visible=lambda i: _update_state["info"] is not None),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("タスクバーの表示設定を開く...", on_open_taskbar_settings),
+        pystray.MenuItem(lambda i: L("Launch at sign-in", "サインイン時に起動する"), toggle("startup"), checked=lambda i: is_on("startup")),
+        pystray.MenuItem(lambda i: L("Show brightness after adjusting", "調整後の明るさを表示する"), toggle("show_toast_after"), checked=lambda i: is_on("show_toast_after")),
+        pystray.MenuItem(lambda i: L("Show current number", "現在の数字を表示する"), toggle("show_number"), checked=lambda i: is_on("show_number")),
+        pystray.MenuItem(lambda i: L("Delay change until stopped", "止まるまで変更を遅らせる"), toggle("delay_until_release"), checked=lambda i: is_on("delay_until_release")),
+        pystray.MenuItem(lambda i: L("Link sliders together", "一斉に動かせるようにする"), toggle("link_sliders"), checked=lambda i: is_on("link_sliders")),
         pystray.Menu.SEPARATOR,
-        pystray.MenuItem("終了", on_quit),
+        pystray.MenuItem(lambda i: L("Auto-update", "自動アップデート"), toggle("auto_update"), checked=lambda i: is_on("auto_update")),
+        pystray.MenuItem(lambda i: L("What's New...", "更新内容..."), on_show_notes),
+        pystray.MenuItem("Language / 言語", pystray.Menu(
+            pystray.MenuItem("English", set_language("en"), checked=lambda i: LANG == "en", radio=True),
+            pystray.MenuItem("日本語", set_language("ja"), checked=lambda i: LANG == "ja", radio=True),
+        )),
+        pystray.MenuItem(lambda i: L("Open taskbar display settings...", "タスクバーの表示設定を開く..."),
+                         on_open_taskbar_settings),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem(lambda i: L("Exit", "終了"), on_quit),
     )
 
 
 def run_app():
+    global LANG
     enable_dpi_awareness()
     kill_previous_instances()
 
     settings = load_config()
-    if not os.path.exists(CONFIG_FILE):
+    LANG = "ja" if settings.get("language") == "ja" else "en"
+    if not os.path.exists(CONFIG_FILE) or any(k not in settings for k in DEFAULT_SETTINGS):
         save_config(settings)
 
     root = tk.Tk()
     root.withdraw()
     root.report_callback_exception = lambda exc_type, exc_value, tb: log_error("tk_callback", exc_value)
+    resolve_font_family(root)
 
     toast_manager = ToastManager(root)
     root._toast_manager = toast_manager  # SliderPanelから参照するため
     panel = SliderPanel(root)
 
-    tray_icon = pystray.Icon("Lumina", render_tray_icon(), "Lumina", _build_menu())
+    tray_icon = pystray.Icon("Lumina", render_tray_icon(), f"Lumina v{__version__}", _build_menu())
+
+    def on_theme_changed(is_light):
+        # pystrayのiconプロパティへの代入はスレッドセーフ(内部でトレイの
+        # ウィンドウにメッセージを投げて差し替える)なので、監視スレッドから直接行う
+        tray_icon.icon = render_tray_icon(is_light)
+
+    def start_update(info):
+        latest_tag, release_url, package_url, notes = info
+        if package_url and getattr(sys, "frozen", False):
+            toast_manager.begin_update(latest_tag, release_url, package_url, notes)
+        else:
+            webbrowser.open(release_url)
 
     def poll_ui_queue():
         try:
@@ -1111,6 +1602,15 @@ def run_app():
                 action, payload = _ui_action_queue.get_nowait()
                 if action == "open_panel":
                     panel.toggle()
+                elif action == "show_notes":
+                    threading.Thread(target=_fetch_release_notes_worker, daemon=True).start()
+                elif action == "install_update":
+                    if _update_state["info"]:
+                        start_update(_update_state["info"])
+                elif action == "language_changed":
+                    # 開いているパネルは閉じる(次に開いた時に新しい言語で描かれる)
+                    panel.close()
+                    tray_icon.update_menu()
                 elif action == "quit":
                     tray_icon.stop()
                     root.after(50, root.destroy)
@@ -1119,20 +1619,54 @@ def run_app():
 
         try:
             while True:
-                latest_tag, release_url = _update_queue.get_nowait()
-                toast_manager.show_update_available(latest_tag, release_url)
+                info = _update_queue.get_nowait()
+                _update_state["info"] = info
+                tray_icon.update_menu()
+                auto = load_config().get("auto_update", "0") == "1"
+                toast_manager.show_update_available(*info, auto=auto)
         except queue.Empty:
             pass
         except Exception as e:
             log_error("poll_update_queue", e)
 
+        try:
+            while True:
+                status, _ = _install_status_queue.get_nowait()
+                toast_manager.finish_update(status == "done")
+                if status == "done":
+                    # 差し替え用のバッチはこのプロセスの終了を待っているので、
+                    # 「再起動します」の表示を少し見せてから終了する
+                    root.after(1500, lambda: _ui_action_queue.put(("quit", None)))
+        except queue.Empty:
+            pass
+
+        try:
+            while True:
+                status, version, notes = _notes_queue.get_nowait()
+                if status == "ok":
+                    toast_manager.show_whats_new(version, notes, header=L("What's New", "更新内容"))
+                else:
+                    toast_manager.show_whats_new(
+                        f"v{__version__}",
+                        L("Couldn't load the release notes.\nPlease check your internet connection.",
+                          "更新内容を取得できませんでした。\nインターネット接続を確認してください。"),
+                        header=L("What's New", "更新内容"))
+        except queue.Empty:
+            pass
+
         root.after(50, poll_ui_queue)
 
     root.after(50, poll_ui_queue)
 
+    pending_notice = _read_pending_update_notice()
+    if pending_notice:
+        version, notes = pending_notice
+        root.after(800, lambda: toast_manager.show_whats_new(version or f"v{__version__}", notes))
+
     threading.Thread(target=tray_icon.run, daemon=True).start()
     threading.Thread(target=_brightness_writer_worker, daemon=True).start()
     threading.Thread(target=_update_check_loop, daemon=True).start()
+    threading.Thread(target=_watch_taskbar_theme, args=(on_theme_changed,), daemon=True).start()
     root.mainloop()
 
 

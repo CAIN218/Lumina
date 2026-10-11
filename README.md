@@ -21,7 +21,10 @@ Click the icon in the taskbar's notification area to adjust the brightness of ev
 
 ### 1. Launch
 
-Run `Lumina.exe` (or `python lumina.py`) and a sun icon appears in the taskbar's notification area. No window is shown.
+Run `Lumina.exe` (or `python lumina.py`) and a monitor-and-sun icon appears in the taskbar's notification area. No window is shown.
+
+The icon follows your Windows color mode: white lines on a dark taskbar, dark lines on a light taskbar, so it never
+blends into the background. Switching between light and dark mode updates it immediately.
 
 ### 2. Adjust brightness
 
@@ -35,8 +38,8 @@ regardless of this setting.
 
 ### 3. Change settings
 
-**Right-click** the tray icon to open the settings menu. Every option is a checkable toggle that applies
-immediately (no save button needed).
+**Right-click** the tray icon to open the settings menu. The top line shows the version you're running, and
+every option is a checkable toggle that applies immediately (no save button needed).
 
 | Option | Description |
 |---|---|
@@ -45,9 +48,21 @@ immediately (no save button needed).
 | Show current number | Display each monitor's brightness as a percentage in the panel |
 | Delay change until stopped | When on, dragging doesn't apply until you release; when off, brightness updates live while dragging |
 | Link sliders together | Adds a master fader to the panel that moves every monitor at once |
+| Auto-update | Install new versions automatically as soon as they're found (off by default — you still get a notification) |
+| What's New... | Shows the release notes for the version you're running |
+| Language | Switch the display language between English (default) and Japanese |
 | Open taskbar display settings... | Shortcut straight to Windows' taskbar settings. See the note below |
 
-### 4. Quitting
+### 4. Updates
+
+Lumina checks GitHub Releases once a day. When a new version is out, a notification appears in the
+bottom-right corner — click it to download and install the update (Lumina restarts by itself). With
+"Auto-update" turned on, this happens automatically. A "Update to vX.Y.Z" item also appears at the top of
+the right-click menu until you update. After updating, the release notes are shown once.
+
+When running from source (`python lumina.py`), clicking the notification opens the release page instead.
+
+### 5. Quitting
 
 Right-click the tray icon and choose "Exit".
 
@@ -65,6 +80,7 @@ These files are created next to the exe:
 
 - `app_config.txt` — the settings above, in `key=value` format
 - `error.log` — Error log for troubleshooting
+- `update_notice.json` — Written just before an update so the new version can show its release notes once (deleted right after)
 
 ## Building from source
 
@@ -88,9 +104,16 @@ The following features, present in reference apps like Twinkle Tray, are not imp
 
 ## Design notes
 
-Shares AudioSwitcher's design philosophy (resident process, lightweight callbacks, worker threads) but the
-UI is rebuilt around a tray icon, with its own deep indigo/warm-glow color identity ("Lumina" = light)
-instead of reusing AudioSwitcher's look.
+Shares AudioSwitcher's design philosophy (resident process, lightweight callbacks, worker threads) and,
+since v1.1.0, its visual language too: the same dark ink background, off-white text and a single accent
+color taken from the app icon (amber, like the icon's sun), with Yu Gothic UI so Japanese and Latin text
+render in one consistent typeface. The UI itself is built around a tray icon rather than a settings window.
+
+- The tray icon is redrawn whenever Windows' color mode changes. Instead of polling, a background thread
+  waits on `RegNotifyChangeKeyValue` for the `SystemUsesLightTheme` registry value
+- Lumina ships as a portable zip, not an installer, so self-update works by downloading the release zip,
+  extracting the new `Lumina.exe`, and handing off to a small batch script that waits for the running exe
+  to exit, swaps the file, and relaunches it
 
 - The tray icon (pystray) runs its own message loop, so it runs on a separate thread from Tkinter's
   mainloop. Tray-side callbacks (clicks, menu selections) fire on pystray's thread, so all Tk operations

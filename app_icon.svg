@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <!-- Yuga's lab サイトのアプリアイコンと同じモニター＋太陽(暗背景＋白線＋アンバー) -->
+  <rect width="256" height="256" rx="56" fill="#16151f"/>
+  <g transform="translate(-160.0 -10.6) scale(0.6)">
+    <rect x="330" y="110" width="300" height="190" rx="18" fill="none" stroke="#e8e4dc" stroke-width="14"/>
+    <path d="M450 300 V346 M510 300 V346 M420 352 H540" stroke="#e8e4dc" stroke-width="14" stroke-linecap="round"/>
+    <circle cx="480" cy="205" r="30" fill="#e0a85a"/>
+    <g stroke="#e0a85a" stroke-width="10" stroke-linecap="round">
+      <line x1="530.0" y1="205.0" x2="544.0" y2="205.0"/>
+      <line x1="515.4" y1="240.4" x2="525.3" y2="250.3"/>
+      <line x1="480.0" y1="255.0" x2="480.0" y2="269.0"/>
+      <line x1="444.6" y1="240.4" x2="434.7" y2="250.3"/>
+      <line x1="430.0" y1="205.0" x2="416.0" y2="205.0"/>
+      <line x1="444.6" y1="169.6" x2="434.7" y2="159.7"/>
+      <line x1="480.0" y1="155.0" x2="480.0" y2="141.0"/>
+      <line x1="515.4" y1="169.6" x2="525.3" y2="159.7"/>
+    </g>
+  </g>
+</svg>

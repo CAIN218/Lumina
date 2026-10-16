@@ -1,5 +1,9 @@
 # Lumina
 
+**One slider panel in the taskbar for the brightness of every monitor.** Stop reaching for the buttons on the back of your external monitors.
+
+![Lumina brightness panel](assets/lumina-panel.gif)
+
 A resident monitor brightness controller for Windows.
 Click the icon in the taskbar's notification area to adjust the brightness of every connected monitor directly, with a modern slider panel.
 
@@ -7,7 +11,17 @@ Click the icon in the taskbar's notification area to adjust the brightness of ev
 - Right-click the icon → a settings menu with checkable toggles for behavior and display options
 - Adjust DDC/CI-capable monitors independently. Turning on "Link sliders together" adds a master fader
   that moves every monitor at once (individual sliders always keep moving independently either way)
+- The tray icon follows your taskbar: white lines on dark, dark lines on light
+- Update notifications from GitHub, with one-click or automatic updates; English / Japanese UI
 - Optionally shows a toast notification with the current brightness after adjusting (off by default)
+
+More info: [Yuga's Lab](https://cain218.github.io/Yuga-lab/)
+
+> **Note:** `Lumina.exe` is not code-signed, so Windows SmartScreen may show a warning the first time you run it. The full source is in this repository if you want to review it first.
+
+## Download
+
+Grab the latest portable zip (`Lumina-vX.Y.Z-win64.zip`) from [Releases](../../releases), extract it, and run `Lumina.exe`. No installer needed.
 
 ## Requirements
 

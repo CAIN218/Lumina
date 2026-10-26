@@ -13,6 +13,8 @@ import tempfile
 import zipfile
 import winreg
 import urllib.request
+import urllib.parse
+import hashlib
 import urllib.error
 import webbrowser
 import winshell
@@ -144,6 +146,55 @@ UPDATE_NOTICE_FILE = os.path.join(BASE_DIR, "update_notice.json")
 _GITHUB_HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": "Lumina-update-check"}
 
 
+_CHECKSUM_ASSET = "SHA256SUMS"
+
+
+def _is_github_release_url(url):
+    """更新ファイルは必ずGitHubのリリースアセットから取る。それ以外のホスト・
+    http:は(APIの応答が改ざんされていても)ダウンロードしない。"""
+    try:
+        p = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    return p.scheme == "https" and p.hostname == "github.com" and p.path.lower().startswith(f"/{GITHUB_REPO.lower()}/releases/download/")
+
+
+def _has_checksum_asset(assets):
+    return any(a.get("name", "") == _CHECKSUM_ASSET for a in assets or [])
+
+
+def _download_verified(url, dest_path, timeout):
+    """urlをdest_pathに保存する。同じリリースのSHA256SUMSに載っているハッシュと
+    一致しなければ保存したファイルを消して例外を投げる(実行も展開もしない)。"""
+    if not _is_github_release_url(url):
+        raise RuntimeError("untrusted update URL")
+    headers = {"User-Agent": "Lumina-update-check"}
+    sums_url = url.rsplit("/", 1)[0] + "/" + _CHECKSUM_ASSET
+    with urllib.request.urlopen(urllib.request.Request(sums_url, headers=headers), timeout=10) as resp:
+        sums = resp.read().decode("utf-8", "replace")
+    name = url.rsplit("/", 1)[1]
+    expected = None
+    for line in sums.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1].lstrip("*") == name:
+            expected = parts[0].lower()
+            break
+    if not expected:
+        raise RuntimeError("no checksum for update file")
+    h = hashlib.sha256()
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as resp, \
+            open(dest_path, "wb") as f:
+        for chunk in iter(lambda: resp.read(65536), b""):
+            h.update(chunk)
+            f.write(chunk)
+    if h.hexdigest() != expected:
+        try:
+            os.remove(dest_path)
+        except OSError:
+            pass
+        raise RuntimeError("update checksum mismatch")
+
+
 def _github_get(path):
     req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}{path}", headers=_GITHUB_HEADERS)
     with urllib.request.urlopen(req, timeout=5) as resp:
@@ -161,11 +212,16 @@ def _fetch_latest_release_info():
     release_url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
     notes = data.get("body") or ""
     package_url = None
-    for asset in data.get("assets", []) or []:
-        name = asset.get("name", "").lower()
-        if name.startswith("lumina") and name.endswith(".zip"):
-            package_url = asset.get("browser_download_url")
-            break
+    # SHA256SUMSが無いリリースは自動更新せず、リリースページを開くフォール
+    # バックに任せる(検証できないファイルは展開も実行もしない)。
+    if _has_checksum_asset(data.get("assets")):
+        for asset in data.get("assets", []) or []:
+            name = asset.get("name", "").lower()
+            if name.startswith("lumina") and name.endswith(".zip"):
+                url = asset.get("browser_download_url")
+                if _is_github_release_url(url or ""):
+                    package_url = url
+                break
     if latest_tag and _parse_version(latest_tag) > _parse_version(__version__):
         return (latest_tag, release_url, package_url, notes)
     return None
@@ -245,9 +301,7 @@ def _download_and_apply_update(package_url, release_url, latest_tag="", notes=""
             raise RuntimeError("self-update is only available in the packaged exe")
         work_dir = tempfile.mkdtemp(prefix="lumina-update-")
         zip_path = os.path.join(work_dir, "package.zip")
-        req = urllib.request.Request(package_url, headers={"User-Agent": "Lumina-update-check"})
-        with urllib.request.urlopen(req, timeout=60) as resp, open(zip_path, "wb") as f:
-            f.write(resp.read())
+        _download_verified(package_url, zip_path, 60)
 
         new_exe = os.path.join(work_dir, "Lumina.exe")
         with zipfile.ZipFile(zip_path) as zf:
@@ -258,6 +312,10 @@ def _download_and_apply_update(package_url, release_url, latest_tag="", notes=""
                 dst.write(src.read())
 
         target = sys.executable
+        # 値をそのままバッチに書き込むので、cmdが特別扱いする文字を含むパスでは
+        # 差し替えを中止する(誤動作・コマンド注入の防止)。
+        if any(c in target + new_exe for c in '%&^|<>!"'):
+            raise RuntimeError("unsafe characters in path for update script")
         script = os.path.join(work_dir, "apply_update.cmd")
         # copyが成功する(=旧プロセスが終わってexeのロックが外れる)まで最大60秒
         # 待つ。それでも失敗した場合は差し替えずに元のexeをそのまま起動し直す。

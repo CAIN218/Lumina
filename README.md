@@ -15,7 +15,7 @@ Click the icon in the taskbar's notification area to adjust the brightness of ev
 - Update notifications from GitHub, with one-click or automatic updates; English / Japanese UI
 - Optionally shows a toast notification with the current brightness after adjusting (off by default)
 
-More info: [Yuga's Lab](https://cain218.github.io/Yuga-lab/)
+More info: [Gentlebit](https://cain218.github.io/Gentlebit/)
 
 > **Note:** `Lumina.exe` is not code-signed, so Windows SmartScreen may show a warning the first time you run it. The full source is in this repository if you want to review it first.
 

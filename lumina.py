@@ -209,7 +209,10 @@ def _fetch_latest_release_info():
     処理すること。"""
     data = _github_get("/releases/latest")
     latest_tag = data.get("tag_name", "")
-    release_url = data.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases/latest"
+    release_url = data.get("html_url") or ""
+    # webbrowser.openに渡すので、このリポジトリのGitHubページ以外は使わない。
+    if not release_url.lower().startswith(f"https://github.com/{GITHUB_REPO.lower()}/"):
+        release_url = f"https://github.com/{GITHUB_REPO}/releases/latest"
     notes = data.get("body") or ""
     package_url = None
     # SHA256SUMSが無いリリースは自動更新せず、リリースページを開くフォール
